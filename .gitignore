@@ -1,0 +1,42 @@
+.env
+.env.*
+!.env.example
+.envrc
+*.local
+
+# Python caches and tooling
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime outputs and verification artifacts
+*.log
+*.pid
+rendered-*.json
+rendered-*.html
+verify-*.log
+webpy-*.json
+webpy-*.log
+uvicorn-*.log
+web-*.log
+
+# Local-only working directories
+data/
+logs/
+tmp/
+temp/
+runtime/
+artifacts/
