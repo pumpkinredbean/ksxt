@@ -1,4 +1,4 @@
-"""Collector-side publisher scaffolding kept separate from the current runtime loop."""
+"""Collector-side dashboard publisher helpers."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from packages.adapters.base import MarketDataEvent
-
-
+from packages.contracts.events import DashboardEventEnvelope
+from packages.contracts.topics import DASHBOARD_EVENTS_TOPIC
 def _to_transport_value(value: Any) -> Any:
     if is_dataclass(value):
         return {key: _to_transport_value(item) for key, item in asdict(value).items()}
@@ -27,10 +26,27 @@ def _to_transport_value(value: Any) -> Any:
 
 
 class CollectorPublisher:
-    """Publisher seam for collector fan-out without committing to Kafka yet."""
+    """Publish collector dashboard events to the broker."""
 
-    async def publish(self, event: MarketDataEvent) -> dict[str, Any]:
-        return _to_transport_value(event)
+    def __init__(self, broker: Any):
+        self._broker = broker
 
-    async def publish_many(self, events: list[MarketDataEvent]) -> list[dict[str, Any]]:
-        return [await self.publish(event) for event in events]
+    async def publish_dashboard_event(
+        self,
+        *,
+        symbol: str,
+        market: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        message = _to_transport_value(
+            DashboardEventEnvelope(
+                symbol=symbol,
+                market=market.lower(),
+                event_name=event_name,
+                payload=payload,
+                published_at=datetime.utcnow(),
+            )
+        )
+        await self._broker.publish(topic=DASHBOARD_EVENTS_TOPIC, value=message, key=f"{market.lower()}:{symbol}")
+        return message

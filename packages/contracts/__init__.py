@@ -1,9 +1,10 @@
 """Transport-safe shared contracts for broker-agnostic events."""
 
-from .events import CanonicalEvent, CanonicalEventEnvelope, EventType
+from .events import CanonicalEvent, CanonicalEventEnvelope, DashboardEventEnvelope, EventType
 from .subscriptions import ChannelType, SubscriptionSpec
 from .topics import (
     CANONICAL_EVENTS_TOPIC,
+    DASHBOARD_EVENTS_TOPIC,
     ORDER_BOOK_SNAPSHOT_TOPIC,
     PROGRAM_TRADE_TOPIC,
     RAW_EVENTS_TOPIC,
@@ -15,6 +16,8 @@ __all__ = [
     "ChannelType",
     "CanonicalEvent",
     "CanonicalEventEnvelope",
+    "DASHBOARD_EVENTS_TOPIC",
+    "DashboardEventEnvelope",
     "EventType",
     "ORDER_BOOK_SNAPSHOT_TOPIC",
     "PROGRAM_TRADE_TOPIC",

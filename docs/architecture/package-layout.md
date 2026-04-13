@@ -52,9 +52,9 @@ src/
 
 ## App roles
 
-- `apps/collector`: collector-stage runtime entrypoint; currently placeholder
+- `apps/collector`: collector-stage FastAPI runtime entrypoint with `/health` and `/stream`; owns live upstream subscriptions for the current dashboard path
 - `apps/processor`: processor-stage runtime entrypoint; currently placeholder
-- `apps/api_web`: API/dashboard entrypoint
+- `apps/api_web`: API/dashboard entrypoint that relays collector SSE for browser clients
 
 ## Dependency direction
 
@@ -65,4 +65,4 @@ src/
 
 ## Migration note
 
-The repository still contains a compatibility-heavy `src/` layer with active KIS-backed behavior. New shared architecture should continue moving toward package-based boundaries without overstating the maturity of collector and processor runtimes.
+The repository still contains a compatibility-heavy `src/` layer with active KIS-backed behavior. The current dashboard runtime is collector-owned streaming plus web-side SSE relay, while broader processor/storage architecture remains intentionally incomplete.

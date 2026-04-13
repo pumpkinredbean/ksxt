@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta
 from typing import Any
 
 from packages.adapters.base import MarketDataEvent
 from packages.adapters.kis.adapter import KISMarketDataAdapter
 from packages.domain.enums import Venue
 from packages.domain.models import InstrumentRef
+from src.kis_websocket import KISProgramTradeClient
 
 
 TRADE_PRICE_RENAME_MAP = {
@@ -74,14 +76,58 @@ def _format_dashboard_event(event: MarketDataEvent) -> tuple[str, dict[str, Any]
     return "program_trade", payload
 
 
+def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list[dict[str, Any]]:
+    buckets: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    for row in rows:
+        time_text = str(row.get("stck_cntg_hour") or "").strip()
+        if len(time_text) != 6 or not time_text.isdigit():
+            continue
+
+        try:
+            price = float(row.get("stck_prpr", 0) or 0)
+            open_price = float(row.get("stck_oprc", 0) or 0)
+            high_price = float(row.get("stck_hgpr", 0) or 0)
+            low_price = float(row.get("stck_lwpr", 0) or 0)
+            volume = int(float(row.get("cntg_vol", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+
+        point_time = datetime.strptime(time_text, "%H%M%S")
+        bucket_minute = (point_time.minute // interval) * interval
+        bucket_time = point_time.replace(minute=bucket_minute, second=0)
+        bucket_key = bucket_time.strftime("%H%M")
+
+        if current is None or current["key"] != bucket_key:
+            current = {
+                "key": bucket_key,
+                "label": bucket_time.strftime("%H:%M"),
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": price,
+                "volume": volume,
+            }
+            buckets.append(current)
+        else:
+            current["high"] = max(current["high"], high_price)
+            current["low"] = min(current["low"], low_price)
+            current["close"] = price
+            current["volume"] += volume
+
+    return buckets[-120:]
+
+
 class CollectorRuntime:
     """Collector-owned live runtime for dashboard consumers."""
 
     def __init__(self, settings: Any):
         self._adapter = KISMarketDataAdapter(settings)
+        self._chart_client = KISProgramTradeClient(settings)
 
     async def aclose(self) -> None:
-        return None
+        await self._chart_client.aclose()
 
     async def stream_dashboard(self, *, symbol: str, market: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         if market.lower() != "krx":
@@ -90,3 +136,15 @@ class CollectorRuntime:
         instrument = InstrumentRef(symbol=symbol, instrument_id=symbol, venue=Venue.KRX)
         async for event in self._adapter.stream_dashboard_events(instrument):
             yield _format_dashboard_event(event)
+
+    def fetch_price_chart(self, *, symbol: str, market: str, interval: int) -> dict[str, Any]:
+        rows = self._chart_client.fetch_intraday_chart(symbol=symbol, market=market)
+        candles = _aggregate_minute_candles(rows, interval)
+        return {
+            "symbol": symbol,
+            "market": market,
+            "interval": interval,
+            "candles": candles,
+            "source": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            "tr_id": "FHKST03010200",
+        }

@@ -2,44 +2,29 @@
 
 ## Commands
 - Setup: `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
-- Dashboard: `python web.py`
-- FastAPI entrypoint: `uvicorn apps.api_web.app:app --reload`
-- CLI watcher: `python main.py --symbol 005930 --market krx`
-- Placeholder services: `python -m apps.collector.service` / `python -m apps.processor.service`
-- Compose stack: `docker compose up --build`
+- Web app: `uvicorn apps.api_web.app:app --reload`
+- Dashboard path: `python web.py`
+- CLI path: `python main.py --symbol 005930 --market krx`
 - Compose check: `docker compose config`
 
-## Repo reality
-- Treat this repo as a monorepo with `apps/`, `packages/`, `src/`, and `compose.yaml` as the main navigation points.
-- `apps/api_web/app.py` is a thin re-export entrypoint; the real FastAPI app lives in `src/web_app.py`.
-- `apps/collector` and `apps/processor` are still placeholder heartbeat services, not full data pipeline services.
-- Shared env loading and event helpers live in `packages/shared/config.py` and `packages/shared/events.py`.
-- `src/` is the compatibility-heavy implementation layer with the real dashboard and KIS websocket logic.
-
-## Architecture boundaries
-- Put cross-service config, env defaults, topic constants, and event helpers in `packages/shared`.
-- Put deploy/runtime-specific web entrypoint concerns in `apps/api_web`, not dashboard logic.
-- Put real dashboard behavior, compatibility shims, and KIS-specific implementation in `src`.
+## Scope
+- Treat this repo as a small monorepo with three working units: `apps/`, `packages/`, and `src/`.
+- Keep AGENTS guidance at monorepo-unit level only. Do not add new per-app or per-package AGENTS files unless the repo structure changes materially.
+- `src/` holds the real dashboard and KIS integration logic.
+- `apps/` holds runtime entrypoints and placeholder services.
+- `packages/` holds reusable shared code and deeper package layers.
 
 ## Always
-- Read `README.md`, `compose.yaml`, and the relevant entrypoint before changing behavior.
-- Check `src` before editing `apps/api_web`; most web behavior changes belong in `src/web_app.py`.
-- Keep docs and examples public-safe: describe env keys and defaults only, never local secret values.
-- If a contract is shared by multiple services, update `packages/shared` instead of duplicating it.
+- Read the nearest retained AGENTS file before changing files in `apps/`, `packages/`, or `src/`.
+- Keep guidance accurate to current repo reality; do not describe unfinished parts as mature systems.
+- Keep examples and docs public-safe; never copy local secrets or `.env` values.
 
 ## Ask First
-- Adding a new app or package.
-- Renaming services, topics, env keys, ports, or compose dependencies.
+- Adding a new top-level monorepo unit.
+- Reintroducing nested AGENTS files below `apps/`, `packages/`, or `src/`.
 - Breaking compatibility paths such as `web.py`, `main.py`, `apps.api_web.app:app`, or `src/config.py` re-exports.
-- Turning placeholder collector/processor services into real pipeline components.
 
 ## Never
-- Read from `.env` to copy real values into code, docs, tests, or examples.
-- Treat `apps/api_web/app.py` as the place for dashboard business logic.
-- Document collector or processor as production-ready when they only emit heartbeat placeholder events.
-- Move shared config/event contracts into per-app one-off helpers.
-
-## Verification
-- Web path: `uvicorn apps.api_web.app:app --reload`
-- Compatibility path: `python web.py`
-- Placeholder services: `python -m apps.collector.service` and `python -m apps.processor.service`
+- Scatter AGENTS.md files across individual apps or subpackages.
+- Claim collector/processor are production-ready pipelines when they are still placeholder services.
+- Treat thin entrypoints as the source of business logic when the implementation lives elsewhere.

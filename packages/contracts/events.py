@@ -33,3 +33,15 @@ class CanonicalEvent(Generic[TPayload]):
 
 
 CanonicalEventEnvelope = CanonicalEvent
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardEventEnvelope:
+    """Broker-neutral envelope for live dashboard fan-out events."""
+
+    symbol: str
+    market: str
+    event_name: str
+    payload: dict[str, Any]
+    published_at: datetime
+    schema_version: str = "v1"

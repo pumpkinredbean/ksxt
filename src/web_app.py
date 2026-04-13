@@ -3,20 +3,30 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from datetime import datetime
+import os
+import threading
 from textwrap import dedent
 from typing import Any
 
+import requests
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from apps.collector.runtime import CollectorRuntime
-from src.config import settings
-from src.kis_websocket import KISProgramTradeClient
-
-
 app = FastAPI(title="KIS Program Trade Realtime")
-collector_runtime = CollectorRuntime(settings)
+collector_base_url = os.getenv("COLLECTOR_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
+def _serialize_sse_lines(lines: list[str]) -> str:
+    return "".join(f"{line}\n" for line in lines)
+
+
+def _collector_request(
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> requests.Response:
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.request(method, f"{collector_base_url}{path}", **kwargs)
+        return response
 
 
 HTML = dedent(
@@ -290,7 +300,7 @@ HTML = dedent(
           </div>
         </div>
 
-        <div class="footer">브라우저 연결 동안 서버가 프로그램매매, 호가, 현재가 체결 웹소켓을 함께 구독해 대시보드를 갱신합니다.</div>
+        <div class="footer">브라우저 연결 동안 collector 서비스가 라이브 KIS upstream을 소유하고, 웹 앱은 해당 스트림을 중계합니다.</div>
         <div id="layoutToast" class="toast" role="status" aria-live="polite"></div>
       </div>
 
@@ -1041,47 +1051,6 @@ HTML = dedent(
     </html>
     """
 )
-def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list[dict[str, Any]]:
-    buckets: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-
-    for row in rows:
-        time_text = str(row.get("stck_cntg_hour") or "").strip()
-        if len(time_text) != 6 or not time_text.isdigit():
-            continue
-
-        try:
-            price = float(row.get("stck_prpr", 0) or 0)
-            open_price = float(row.get("stck_oprc", 0) or 0)
-            high_price = float(row.get("stck_hgpr", 0) or 0)
-            low_price = float(row.get("stck_lwpr", 0) or 0)
-            volume = int(float(row.get("cntg_vol", 0) or 0))
-        except (TypeError, ValueError):
-            continue
-
-        point_time = datetime.strptime(time_text, "%H%M%S")
-        bucket_minute = (point_time.minute // interval) * interval
-        bucket_time = point_time.replace(minute=bucket_minute, second=0)
-        bucket_key = bucket_time.strftime("%H%M")
-
-        if current is None or current["key"] != bucket_key:
-            current = {
-                "key": bucket_key,
-                "label": bucket_time.strftime("%H:%M"),
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": price,
-                "volume": volume,
-            }
-            buckets.append(current)
-        else:
-            current["high"] = max(current["high"], high_price)
-            current["low"] = min(current["low"], low_price)
-            current["close"] = price
-            current["volume"] += volume
-
-    return buckets[-120:]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1094,31 +1063,33 @@ async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-@app.on_event("shutdown")
-async def shutdown_runtime() -> None:
-    await collector_runtime.aclose()
-
-
 @app.get("/api/price-chart")
 async def price_chart(
     symbol: str = Query(..., min_length=1),
     market: str = Query("krx", pattern="^(krx|nxt|total)$"),
     interval: int = Query(..., ge=10, le=60),
 ) -> JSONResponse:
-    if interval not in {10, 30, 60}:
-        return JSONResponse({"error": "unsupported interval"}, status_code=400)
-
-    client = KISProgramTradeClient(settings)
-    rows = client.fetch_intraday_chart(symbol=symbol, market=market)
-    candles = _aggregate_minute_candles(rows, interval)
-    return JSONResponse({
-        "symbol": symbol,
-        "market": market,
-        "interval": interval,
-        "candles": candles,
-        "source": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-        "tr_id": "FHKST03010200",
-    })
+    try:
+        response = await asyncio.to_thread(
+            _collector_request,
+            "GET",
+            "/api/price-chart",
+            params={"symbol": symbol, "market": market, "interval": interval},
+            timeout=15,
+        )
+        response.raise_for_status()
+        return JSONResponse(response.json())
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is not None:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {"error": response.text or str(exc)}
+            return JSONResponse(payload, status_code=response.status_code)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    except requests.RequestException as exc:
+        return JSONResponse({"error": f"collector price-chart relay failed: {exc}"}, status_code=502)
 
 
 @app.get("/stream")
@@ -1127,52 +1098,68 @@ async def stream(
     symbol: str = Query(..., min_length=1),
     market: str = Query("krx", pattern="^(krx|nxt|total)$"),
 ) -> StreamingResponse:
-    async def event_generator():
-        disconnect_task = None
-        stream_task: asyncio.Task[Any] | None = None
-        queue: asyncio.Queue[tuple[str, dict[str, Any]] | BaseException | None] = asyncio.Queue()
+    async def event_generator() -> Any:
+        queue: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        stop_event = threading.Event()
+        response_holder: dict[str, requests.Response] = {}
 
-        async def watch_disconnect() -> None:
-            while not await request.is_disconnected():
-                await asyncio.sleep(0.25)
+        def push_queue_item(item: str | BaseException | None) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
 
-        async def pump_dashboard_events() -> None:
+        def pump_collector_stream() -> None:
             try:
-                async for event_name, payload in collector_runtime.stream_dashboard(symbol=symbol, market=market):
-                    if await request.is_disconnected():
-                        return
-                    await queue.put((event_name, payload))
+                with requests.Session() as session:
+                    session.trust_env = False
+                    with session.get(
+                        f"{collector_base_url}/stream",
+                    params={"symbol": symbol, "market": market},
+                    headers={"Accept": "text/event-stream"},
+                    stream=True,
+                    timeout=(5, None),
+                    ) as response:
+                        response_holder["response"] = response
+                        response.raise_for_status()
+                        event_lines: list[str] = []
+                        for line in response.iter_lines(decode_unicode=True):
+                            if stop_event.is_set():
+                                break
+                            normalized_line = line or ""
+                            event_lines.append(normalized_line)
+                            if normalized_line == "":
+                                push_queue_item(_serialize_sse_lines(event_lines))
+                                event_lines = []
+                        if event_lines:
+                            event_lines.append("")
+                            push_queue_item(_serialize_sse_lines(event_lines))
             except Exception as exc:
-                await queue.put(exc)
+                push_queue_item(exc)
             finally:
-                await queue.put(None)
+                push_queue_item(None)
+
+        relay_task = asyncio.create_task(asyncio.to_thread(pump_collector_stream))
 
         try:
-            disconnect_task = asyncio.create_task(watch_disconnect())
-            stream_task = asyncio.create_task(pump_dashboard_events())
-
             while True:
+                if await request.is_disconnected():
+                    return
                 item = await queue.get()
                 if item is None:
                     return
                 if isinstance(item, BaseException):
                     raise item
-                if await request.is_disconnected():
-                    return
-                event_name, payload = item
-                yield f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield item
         except Exception as exc:
             if not await request.is_disconnected():
                 error_payload = {"error": str(exc)}
                 yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
         finally:
-            if stream_task is not None:
-                stream_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await stream_task
-            if disconnect_task is not None:
-                disconnect_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await disconnect_task
+            stop_event.set()
+            response = response_holder.get("response")
+            if response is not None:
+                response.close()
+            relay_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await relay_task
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

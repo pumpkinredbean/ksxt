@@ -21,6 +21,7 @@ Adapters translate provider-specific behavior into shared ingress contracts. The
 - scheduling, supervision, and restart behavior
 - common ingest metadata and observability hooks
 - publishing or routing raw events onward
+- ownership of live upstream subscriptions and local fan-out to downstream consumers
 
 ### Domain/contracts layer
 
@@ -44,5 +45,6 @@ Adapters translate provider-specific behavior into shared ingress contracts. The
 ## Current repo interpretation
 
 - KIS is the active adapter today
+- the collector service is the current live-runtime owner for dashboard streaming and price-chart fetching, while web consumes collector HTTP/SSE downstream
 - broker-neutral scaffolding already exists under `packages/domain`, `packages/contracts`, and `packages/adapters`
 - future adapters should be addable mostly under `packages/adapters/<source>` without redefining the core model

@@ -26,12 +26,13 @@ class ServiceSettings:
 
 
 def load_service_settings(service_name: str) -> ServiceSettings:
+    default_port = "8001" if service_name == "collector" else "8000"
     return ServiceSettings(
         service_name=service_name,
         app_env=os.getenv("APP_ENV", "development").strip() or "development",
         host=os.getenv("APP_HOST", "0.0.0.0").strip() or "0.0.0.0",
-        port=int(os.getenv("APP_PORT", "8000")),
-        bootstrap_servers=os.getenv("BOOTSTRAP_SERVERS", "redpanda:9092").strip() or "redpanda:9092",
+        port=int(os.getenv("APP_PORT", default_port)),
+        bootstrap_servers=os.getenv("BOOTSTRAP_SERVERS", "localhost:19092").strip() or "localhost:19092",
         clickhouse_url=os.getenv("CLICKHOUSE_URL", "http://clickhouse:8123").strip() or "http://clickhouse:8123",
         symbol=(os.getenv("SYMBOL") or os.getenv("KIS_SYMBOL") or "005930").strip() or "005930",
         market=(os.getenv("MARKET") or os.getenv("KIS_MARKET") or "krx").strip() or "krx",

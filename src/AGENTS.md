@@ -1,15 +1,15 @@
 # AGENTS.md
 
 ## Commands
-- FastAPI app: `uvicorn apps.api_web.app:app --reload`
-- Compatibility dashboard path: `python web.py`
-- Compatibility CLI path: `python main.py --symbol 005930 --market krx`
+- Web app: `uvicorn apps.api_web.app:app --reload`
+- Dashboard path: `python web.py`
+- CLI path: `python main.py --symbol 005930 --market krx`
 
 ## Scope
+- `src/` holds the real implementation behind the thin app entrypoints.
 - `web_app.py` contains the real dashboard implementation.
-- `kis_websocket.py` contains the KIS REST/websocket integration and schema-heavy mapping logic.
-- `config.py` is a thin compatibility re-export over `packages.shared.config`.
-- This directory is the compatibility-heavy implementation layer; prefer targeted edits over structural rewrites.
+- `kis_websocket.py` contains the KIS integration and schema-heavy mapping logic.
+- `config.py` is a compatibility re-export over `packages.shared.config`.
 
 ## Always
 - Keep `apps/api_web`, `web.py`, and `main.py` compatibility paths working.
