@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import time
 
+from packages.contracts.topics import RAW_EVENTS_TOPIC
 from packages.shared.config import load_service_settings
-from packages.shared.events import RAW_EVENTS_TOPIC, build_service_event
+from packages.shared.events import build_service_event
 
 
 def main() -> None:

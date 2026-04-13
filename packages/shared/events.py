@@ -4,10 +4,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 
-RAW_EVENTS_TOPIC = "kis.raw.program-trade.v1"
-PROCESSED_EVENTS_TOPIC = "kis.processed.program-trade.v1"
-
-
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 

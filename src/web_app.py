@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import datetime
 from textwrap import dedent
 from typing import Any
 
-import pandas as pd
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from apps.collector.runtime import CollectorRuntime
 from src.config import settings
 from src.kis_websocket import KISProgramTradeClient
 
 
 app = FastAPI(title="KIS Program Trade Realtime")
+collector_runtime = CollectorRuntime(settings)
 
 
 HTML = dedent(
@@ -1039,20 +1041,6 @@ HTML = dedent(
     </html>
     """
 )
-
-
-def to_native_dict(record: dict[str, Any]) -> dict[str, Any]:
-    normalized: dict[str, Any] = {}
-    for key, value in record.items():
-        if pd.isna(value):
-            normalized[key] = None
-        elif hasattr(value, "item"):
-            normalized[key] = value.item()
-        else:
-            normalized[key] = value
-    return normalized
-
-
 def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list[dict[str, Any]]:
     buckets: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
@@ -1106,6 +1094,11 @@ async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.on_event("shutdown")
+async def shutdown_runtime() -> None:
+    await collector_runtime.aclose()
+
+
 @app.get("/api/price-chart")
 async def price_chart(
     symbol: str = Query(..., min_length=1),
@@ -1134,38 +1127,52 @@ async def stream(
     symbol: str = Query(..., min_length=1),
     market: str = Query("krx", pattern="^(krx|nxt|total)$"),
 ) -> StreamingResponse:
-    client = KISProgramTradeClient(settings)
-
     async def event_generator():
         disconnect_task = None
+        stream_task: asyncio.Task[Any] | None = None
+        queue: asyncio.Queue[tuple[str, dict[str, Any]] | BaseException | None] = asyncio.Queue()
 
         async def watch_disconnect() -> None:
             while not await request.is_disconnected():
                 await asyncio.sleep(0.25)
-            await client.aclose()
+
+        async def pump_dashboard_events() -> None:
+            try:
+                async for event_name, payload in collector_runtime.stream_dashboard(symbol=symbol, market=market):
+                    if await request.is_disconnected():
+                        return
+                    await queue.put((event_name, payload))
+            except Exception as exc:
+                await queue.put(exc)
+            finally:
+                await queue.put(None)
 
         try:
             disconnect_task = asyncio.create_task(watch_disconnect())
-            async for event in client.subscribe_dashboard(symbol=symbol, market=market):
-                if await request.is_disconnected():
-                    break
-                event_name = event["event"]
-                frame = event["frame"]
-                if frame.empty:
-                    continue
+            stream_task = asyncio.create_task(pump_dashboard_events())
 
-                for _, row in frame.iterrows():
-                    if await request.is_disconnected():
-                        return
-                    payload = to_native_dict(row.to_dict())
-                    yield f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                if await request.is_disconnected():
+                    return
+                event_name, payload = item
+                yield f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
         except Exception as exc:
             if not await request.is_disconnected():
                 error_payload = {"error": str(exc)}
                 yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
         finally:
+            if stream_task is not None:
+                stream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stream_task
             if disconnect_task is not None:
                 disconnect_task.cancel()
-            await client.aclose()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

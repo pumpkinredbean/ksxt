@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import time
 
+from packages.contracts.topics import CANONICAL_EVENTS_TOPIC
 from packages.shared.config import load_service_settings
-from packages.shared.events import PROCESSED_EVENTS_TOPIC, build_service_event
+from packages.shared.events import build_service_event
 
 
 def main() -> None:
@@ -15,7 +16,7 @@ def main() -> None:
             event_type="processor.heartbeat",
             source="apps.processor.service",
             payload={
-                "topic": PROCESSED_EVENTS_TOPIC,
+                "topic": CANONICAL_EVENTS_TOPIC,
                 "bootstrap_servers": settings.bootstrap_servers,
                 "clickhouse_url": settings.clickhouse_url,
                 "phase": "phase-1-placeholder",
