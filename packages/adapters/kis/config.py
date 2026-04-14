@@ -21,7 +21,7 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _apply_proxy_bypass() -> None:
-    if not _bool_env("KIS_BYPASS_PROXY", True):
+    if not _bool_env("KIS_BYPASS_PROXY", False):
         return
 
     for env_name in ("NO_PROXY", "no_proxy"):

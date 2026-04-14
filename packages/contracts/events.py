@@ -37,10 +37,13 @@ CanonicalEventEnvelope = CanonicalEvent
 
 @dataclass(frozen=True, slots=True)
 class DashboardEventEnvelope:
-    """Broker-neutral envelope for live dashboard fan-out events."""
+    """Broker-neutral envelope for live dashboard fan-out events.
+
+    `market_scope` represents request selection scope (`krx|nxt|total`), not a venue model.
+    """
 
     symbol: str
-    market: str
+    market_scope: str
     event_name: str
     payload: dict[str, Any]
     published_at: datetime
@@ -49,11 +52,14 @@ class DashboardEventEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class DashboardControlEnvelope:
-    """Broker-neutral envelope for dashboard publication control."""
+    """Broker-neutral envelope for dashboard publication control.
+
+    `market_scope` represents request selection scope (`krx|nxt|total`), not a venue model.
+    """
 
     action: str
     owner_id: str
     symbol: str
-    market: str
+    market_scope: str
     requested_at: datetime
     schema_version: str = "v1"

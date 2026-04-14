@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from packages.adapters.base import MarketDataEvent
@@ -40,7 +40,7 @@ ORDER_BOOK_RENAME_MAP = {
 }
 
 
-SUPPORTED_LIVE_MARKETS = {"krx", "nxt", "total"}
+SUPPORTED_MARKET_SCOPES = {"krx", "nxt", "total"}
 
 
 def _to_native_number(value: Any) -> int | float | str | None:
@@ -79,7 +79,30 @@ def _format_dashboard_event(event: MarketDataEvent) -> tuple[str, dict[str, Any]
     return "program_trade", payload
 
 
-def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list[dict[str, Any]]:
+def _parse_session_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if len(text) != 10:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _resolve_row_session_date(row: dict[str, Any], fallback: date) -> date:
+    for key in ("stck_bsop_date", "bsop_date", "trade_date"):
+        raw = row.get(key)
+        text = str(raw or "").strip()
+        if len(text) == 8 and text.isdigit():
+            try:
+                return datetime.strptime(text, "%Y%m%d").date()
+            except ValueError:
+                continue
+    return fallback
+
+
+def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int, *, session_date: date) -> list[dict[str, Any]]:
+    kst = timezone(timedelta(hours=9))
     normalized_rows: list[dict[str, Any]] = []
 
     for index, row in enumerate(rows):
@@ -101,6 +124,7 @@ def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list
             {
                 "time_text": time_text,
                 "point_time": point_time,
+                "session_date": _resolve_row_session_date(row, session_date),
                 "source_index": index,
                 "price": price,
                 "open": open_price,
@@ -152,12 +176,24 @@ def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list
         bucket_hour = bucket_total_minutes // 60
         bucket_minute = bucket_total_minutes % 60
         bucket_label = f"{bucket_hour:02d}:{bucket_minute:02d}"
-        bucket_key = f"{bucket_hour:02d}{bucket_minute:02d}"
+        bucket_session_date = row["session_date"]
+        bucket_key = f"{bucket_session_date.isoformat()}-{bucket_hour:02d}{bucket_minute:02d}"
+        bucket_dt = datetime(
+            bucket_session_date.year,
+            bucket_session_date.month,
+            bucket_session_date.day,
+            bucket_hour,
+            bucket_minute,
+            tzinfo=kst,
+        )
 
         if current_bucket is None or current_bucket["key"] != bucket_key:
             current_bucket = {
                 "key": bucket_key,
+                "time": int(bucket_dt.timestamp()),
                 "label": bucket_label,
+                "session_date": bucket_session_date.isoformat(),
+                "source_time": row["time_text"],
                 "open": row["open"],
                 "high": row["high"],
                 "low": row["low"],
@@ -170,6 +206,7 @@ def _aggregate_minute_candles(rows: list[dict[str, Any]], interval: int) -> list
         current_bucket["high"] = max(current_bucket["high"], row["high"], row["price"])
         current_bucket["low"] = min(current_bucket["low"], row["low"], row["price"])
         current_bucket["close"] = row["price"]
+        current_bucket["source_time"] = row["time_text"]
         current_bucket["volume"] += row["volume"]
 
     return buckets[-120:]
@@ -185,22 +222,27 @@ class CollectorRuntime:
     async def aclose(self) -> None:
         await self._chart_client.aclose()
 
-    async def stream_dashboard(self, *, symbol: str, market: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        normalized_market = market.strip().lower()
-        if normalized_market not in SUPPORTED_LIVE_MARKETS:
-            raise ValueError(f"unsupported live market: {market}")
+    async def stream_dashboard(self, *, symbol: str, market_scope: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        normalized_market_scope = market_scope.strip().lower()
+        if normalized_market_scope not in SUPPORTED_MARKET_SCOPES:
+            raise ValueError(f"unsupported market scope: {market_scope}")
         instrument = InstrumentRef(symbol=symbol, instrument_id=symbol, venue=Venue.KRX)
-        async for event in self._adapter.stream_dashboard_events(instrument, market=normalized_market):
+        async for event in self._adapter.stream_dashboard_events(instrument, market=normalized_market_scope):
             yield _format_dashboard_event(event)
 
-    def fetch_price_chart(self, *, symbol: str, market: str, interval: int) -> dict[str, Any]:
-        rows = self._chart_client.fetch_intraday_chart(symbol=symbol, market=market)
-        candles = _aggregate_minute_candles(rows, interval)
+    def fetch_price_chart(self, *, symbol: str, market_scope: str, interval: int) -> dict[str, Any]:
+        chart_payload = self._chart_client.fetch_intraday_chart(symbol=symbol, market=market_scope)
+        rows = chart_payload.get("rows") if isinstance(chart_payload, dict) else []
+        session_date = _parse_session_date(chart_payload.get("session_date")) if isinstance(chart_payload, dict) else None
+        resolved_session_date = session_date or datetime.now(timezone(timedelta(hours=9))).date()
+        candles = _aggregate_minute_candles(rows, interval, session_date=resolved_session_date)
         return {
             "symbol": symbol,
-            "market": market,
+            "market_scope": market_scope,
+            "market": market_scope,
             "interval": interval,
             "candles": candles,
+            "session_date": resolved_session_date.isoformat(),
             "source": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             "tr_id": "FHKST03010200",
         }

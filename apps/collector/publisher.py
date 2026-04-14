@@ -38,17 +38,18 @@ class CollectorPublisher:
         action: str,
         owner_id: str,
         symbol: str,
-        market: str,
+        market_scope: str,
     ) -> dict[str, Any]:
         message = _to_transport_value(
             DashboardControlEnvelope(
                 action=action,
                 owner_id=owner_id,
                 symbol=symbol,
-                market=market.lower(),
+                market_scope=market_scope.lower(),
                 requested_at=datetime.utcnow(),
             )
         )
+        message["market"] = message["market_scope"]
         await self._broker.publish(topic=DASHBOARD_CONTROL_TOPIC, value=message, key=owner_id)
         return message
 
@@ -56,18 +57,19 @@ class CollectorPublisher:
         self,
         *,
         symbol: str,
-        market: str,
+        market_scope: str,
         event_name: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         message = _to_transport_value(
             DashboardEventEnvelope(
                 symbol=symbol,
-                market=market.lower(),
+                market_scope=market_scope.lower(),
                 event_name=event_name,
                 payload=payload,
                 published_at=datetime.utcnow(),
             )
         )
-        await self._broker.publish(topic=DASHBOARD_EVENTS_TOPIC, value=message, key=f"{market.lower()}:{symbol}")
+        message["market"] = message["market_scope"]
+        await self._broker.publish(topic=DASHBOARD_EVENTS_TOPIC, value=message, key=f"{market_scope.lower()}:{symbol}")
         return message

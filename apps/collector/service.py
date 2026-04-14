@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from apps.collector.publisher import CollectorPublisher
-from apps.collector.runtime import CollectorRuntime, SUPPORTED_LIVE_MARKETS
+from apps.collector.runtime import CollectorRuntime, SUPPORTED_MARKET_SCOPES
 from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC
 from packages.infrastructure.kafka import AsyncKafkaJsonBroker
 from packages.shared.config import load_service_settings
@@ -26,11 +26,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class DashboardSubscription:
     symbol: str
-    market: str
+    market_scope: str
 
     @property
     def subscription_key(self) -> str:
-        return f"dashboard:{self.market.lower()}:{self.symbol}"
+        return f"dashboard:{self.market_scope.lower()}:{self.symbol}"
 
 
 @dataclass(slots=True)
@@ -41,7 +41,19 @@ class ActiveDashboardPublication:
 
 class DashboardSubscriptionRequest(BaseModel):
     symbol: str
-    market: str
+
+    market_scope: str | None = None
+    market: str | None = None
+
+    def resolved_market_scope(self) -> str:
+        return _resolve_market_scope(scope=self.market_scope, market=self.market)
+
+
+def _resolve_market_scope(*, scope: str | None = None, market: str | None = None) -> str:
+    resolved = (scope or market or "").strip().lower()
+    if resolved not in SUPPORTED_MARKET_SCOPES:
+        raise ValueError(f"unsupported market scope: {scope or market}")
+    return resolved
 
 
 class CollectorDashboardService:
@@ -81,8 +93,8 @@ class CollectorDashboardService:
         await self._broker.aclose()
         await self._collector_runtime.aclose()
 
-    async def start_dashboard_publication(self, *, symbol: str, market: str, owner_id: str | None = None) -> dict[str, Any]:
-        subscription = self._build_subscription(symbol=symbol, market=market)
+    async def start_dashboard_publication(self, *, symbol: str, market_scope: str, owner_id: str | None = None) -> dict[str, Any]:
+        subscription = self._build_subscription(symbol=symbol, market_scope=market_scope)
         resolved_owner_id = owner_id or uuid.uuid4().hex
 
         async with self._lock:
@@ -99,7 +111,8 @@ class CollectorDashboardService:
         return {
             "subscription_id": resolved_owner_id,
             "symbol": subscription.symbol,
-            "market": subscription.market,
+            "market_scope": subscription.market_scope,
+            "market": subscription.market_scope,
             "status": "started",
         }
 
@@ -130,11 +143,11 @@ class CollectorDashboardService:
             "status": "stopped",
         }
 
-    async def fetch_price_chart(self, *, symbol: str, market: str, interval: int) -> dict[str, Any]:
+    async def fetch_price_chart(self, *, symbol: str, market_scope: str, interval: int) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._collector_runtime.fetch_price_chart,
             symbol=symbol,
-            market=market,
+            market_scope=market_scope,
             interval=interval,
         )
 
@@ -154,16 +167,16 @@ class CollectorDashboardService:
         action = str(payload.get("action") or "").strip().lower()
         owner_id = str(payload.get("owner_id") or "").strip()
         symbol = str(payload.get("symbol") or "").strip()
-        market = str(payload.get("market") or "").strip()
+        market_scope = str(payload.get("market_scope") or payload.get("market") or "").strip()
 
         if action not in {"start", "stop"} or not owner_id:
             return
 
         if action == "start":
             try:
-                await self.start_dashboard_publication(symbol=symbol, market=market, owner_id=owner_id)
+                await self.start_dashboard_publication(symbol=symbol, market_scope=market_scope, owner_id=owner_id)
             except Exception:
-                logger.exception("collector failed to start dashboard publication", extra={"symbol": symbol, "market": market})
+                logger.exception("collector failed to start dashboard publication", extra={"symbol": symbol, "market_scope": market_scope})
             return
 
         await self.stop_dashboard_publication(subscription_id=owner_id)
@@ -172,27 +185,25 @@ class CollectorDashboardService:
         try:
             async for event_name, payload in self._collector_runtime.stream_dashboard(
                 symbol=subscription.symbol,
-                market=subscription.market,
+                market_scope=subscription.market_scope,
             ):
                 await self._publisher.publish_dashboard_event(
                     symbol=subscription.symbol,
-                    market=subscription.market,
+                    market_scope=subscription.market_scope,
                     event_name=event_name,
                     payload=payload,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("collector dashboard publication failed", extra={"symbol": subscription.symbol, "market": subscription.market})
+            logger.exception("collector dashboard publication failed", extra={"symbol": subscription.symbol, "market_scope": subscription.market_scope})
 
-    def _build_subscription(self, *, symbol: str, market: str) -> DashboardSubscription:
+    def _build_subscription(self, *, symbol: str, market_scope: str) -> DashboardSubscription:
         normalized_symbol = symbol.strip()
         if not normalized_symbol:
             raise ValueError("symbol is required")
-        normalized_market = market.strip().lower()
-        if normalized_market not in SUPPORTED_LIVE_MARKETS:
-            raise ValueError(f"unsupported live market: {market}")
-        return DashboardSubscription(symbol=normalized_symbol, market=normalized_market)
+        normalized_market_scope = _resolve_market_scope(scope=market_scope)
+        return DashboardSubscription(symbol=normalized_symbol, market_scope=normalized_market_scope)
 
 
 app = FastAPI(title="Collector Service")
@@ -207,6 +218,7 @@ async def health() -> JSONResponse:
             "ok": True,
             "service": service_settings.service_name,
             "symbol": service_settings.symbol,
+            "market_scope": service_settings.market,
             "market": service_settings.market,
         }
     )
@@ -227,7 +239,7 @@ async def start_dashboard_subscription(payload: DashboardSubscriptionRequest) ->
     try:
         response = await dashboard_service.start_dashboard_publication(
             symbol=payload.symbol.strip(),
-            market=payload.market.strip(),
+            market_scope=payload.resolved_market_scope(),
         )
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
@@ -247,16 +259,19 @@ async def stop_dashboard_subscription(subscription_id: str) -> JSONResponse:
 @app.get("/api/price-chart")
 async def price_chart(
     symbol: str = Query(..., min_length=1),
-    market: str = Query("krx", pattern="^(krx|nxt|total)$"),
+    scope: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    market: str | None = Query(None, pattern="^(krx|nxt|total)$"),
     interval: int = Query(..., ge=1, le=60),
 ) -> JSONResponse:
     if interval not in {1, 5, 10, 30, 60}:
         return JSONResponse({"error": "unsupported interval"}, status_code=400)
 
+    market_scope: str | None = None
     try:
+        market_scope = _resolve_market_scope(scope=scope, market=market)
         payload = await dashboard_service.fetch_price_chart(
             symbol=symbol,
-            market=market,
+            market_scope=market_scope,
             interval=interval,
         )
     except ValueError as exc:
@@ -266,13 +281,13 @@ async def price_chart(
     except RuntimeError as exc:
         logger.warning(
             "collector price chart upstream failed",
-            extra={"symbol": symbol, "market": market, "interval": interval},
+            extra={"symbol": symbol, "market_scope": market_scope, "interval": interval},
         )
         return JSONResponse({"error": str(exc)}, status_code=502)
     except Exception:
         logger.exception(
             "collector price chart unexpected failure",
-            extra={"symbol": symbol, "market": market, "interval": interval},
+            extra={"symbol": symbol, "market_scope": market_scope, "interval": interval},
         )
         return JSONResponse({"error": "collector price-chart request failed unexpectedly"}, status_code=500)
 

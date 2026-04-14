@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KIS Program Trade Realtime</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack.min.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="controls">
+      <input id="symbol" value="005930" placeholder="종목코드" />
+      <select id="market" aria-label="시장 범위 선택">
+        <option value="krx">KRX</option>
+        <option value="nxt">NXT</option>
+        <option value="total" selected>TOTAL</option>
+      </select>
+      <button id="saveDefaultLayoutBtn" class="secondary">현재 배치를 기본값으로 저장</button>
+      <button id="resetLayoutBtn" class="secondary">기본 레이아웃 복원</button>
+    </div>
+
+    <div id="dashboard" class="dashboard grid-stack">
+      <div class="grid-stack-item dashboard-widget" gs-x="0" gs-y="0" gs-w="6" gs-h="4" gs-min-w="4" gs-min-h="3" data-widget="program-chart">
+        <div class="grid-stack-item-content">
+          <div class="widget-frame">
+            <div class="widget-handle">
+              <div class="widget-title">프로그램 순매수 차트</div>
+              <div class="widget-note">그리드 정렬 이동 / 리사이즈</div>
+            </div>
+            <div class="widget-body">
+              <div class="panel-header">
+                <div class="chart-header-tools">
+                  <div class="series-toggle" aria-label="프로그램 차트 기준 선택">
+                    <span class="tick-toggle-label">지표</span>
+                    <button class="series-btn active" data-program-mode="qty">체결량</button>
+                    <button class="series-btn" data-program-mode="amt">거래대금</button>
+                  </div>
+                </div>
+              </div>
+              <div id="programChart" class="chart-canvas"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-stack-item dashboard-widget" gs-x="0" gs-y="4" gs-w="6" gs-h="4" gs-min-w="4" gs-min-h="3" data-widget="trade-price-chart">
+        <div class="grid-stack-item-content">
+          <div class="widget-frame">
+            <div class="widget-handle">
+              <div class="widget-title">가격 차트</div>
+              <div class="widget-note">그리드 정렬 이동 / 리사이즈</div>
+            </div>
+            <div class="widget-body">
+              <div class="panel-header">
+                <div class="chart-header-tools">
+                  <div class="price-mode-menu" aria-label="가격 차트 모드 선택">
+                    <label class="price-mode-group-label" for="priceModeSelect">타임프레임</label>
+                    <select id="priceModeSelect" class="price-mode-select">
+                      <option value="tick-1" selected>1틱</option>
+                      <option value="tick-5">5틱</option>
+                      <option value="tick-10">10틱</option>
+                      <option value="tick-30">30틱</option>
+                      <option value="minute-1">1분</option>
+                      <option value="minute-5">5분</option>
+                      <option value="minute-10">10분</option>
+                      <option value="minute-30">30분</option>
+                      <option value="minute-60">60분</option>
+                    </select>
+                  </div>
+                  <div class="sub" id="priceModeLabel">1틱 라인</div>
+                </div>
+              </div>
+              <div id="tradePriceChart" class="chart-canvas"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-stack-item dashboard-widget" gs-x="6" gs-y="0" gs-w="3" gs-h="8" gs-min-w="3" gs-min-h="4" data-widget="orderbook">
+        <div class="grid-stack-item-content">
+          <div class="widget-frame">
+            <div class="widget-handle">
+              <div class="widget-title">실시간 호가</div>
+              <div id="bookTime" class="widget-note">-</div>
+            </div>
+            <div class="widget-body">
+              <div class="depth-summary">
+                <div class="depth-compare">
+                  <div class="depth-compare-header">
+                    <div class="label">전체 호가 잔량 비교</div>
+                    <div id="depthSummaryNote" class="depth-compare-note">-</div>
+                  </div>
+                  <div class="imbalance-bar">
+                    <div id="imbalanceAskBar" class="imbalance-fill imbalance-ask" style="width:50%"></div>
+                    <div id="imbalanceBidBar" class="imbalance-fill imbalance-bid" style="width:50%"></div>
+                    <div class="imbalance-overlay">
+                      <div id="askPressure" class="imbalance-text ask">-</div>
+                      <div id="bidPressure" class="imbalance-text bid">-</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="depth-compare">
+                  <div class="depth-compare-header">
+                    <div class="label">프로그램 호가 잔량 비교</div>
+                    <div class="depth-compare-note">program_trade 기준</div>
+                  </div>
+                  <div class="imbalance-bar">
+                    <div id="programAskBar" class="imbalance-fill imbalance-ask" style="width:50%"></div>
+                    <div id="programBidBar" class="imbalance-fill imbalance-bid" style="width:50%"></div>
+                    <div class="imbalance-overlay">
+                      <div id="programAskPressure" class="imbalance-text ask">-</div>
+                      <div id="programBidPressure" class="imbalance-text bid">-</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="orderbook-shell">
+                <div class="orderbook-scroll">
+                  <div class="ladder-header">
+                    <div>Depth</div>
+                    <div>Price</div>
+                    <div>Qty</div>
+                  </div>
+                  <table class="orderbook-table">
+                    <tbody id="orderbookBody">
+                      <tr><td colspan="3" style="text-align:center; color:#93a4bf;">호가 수신 대기 중</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-stack-item dashboard-widget" gs-x="9" gs-y="0" gs-w="3" gs-h="8" gs-min-w="3" gs-min-h="4" data-widget="history">
+        <div class="grid-stack-item-content">
+          <div class="widget-frame">
+            <div class="widget-handle">
+              <div class="widget-title">체결 히스토리</div>
+              <div class="widget-note">최신 데이터가 위로 누적됩니다.</div>
+            </div>
+            <div class="widget-body">
+              <table class="history-table">
+                <thead>
+                  <tr>
+                    <th>체결시각</th>
+                    <th>순매수 체결량</th>
+                    <th>순매수 거래대금</th>
+                    <th>매도잔량</th>
+                    <th>매수잔량</th>
+                  </tr>
+                </thead>
+              </table>
+              <div class="table-scroll">
+                <table class="history-table">
+                  <tbody id="historyBody">
+                    <tr><td colspan="5" style="text-align:center; color:#93a4bf;">수신 대기 중</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">브라우저 연결 동안 collector 서비스가 라이브 KIS upstream을 소유해 Kafka로 발행하고, 웹 앱은 Kafka 스트림을 브라우저에 전달합니다.</div>
+    <div id="layoutToast" class="toast" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-all.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

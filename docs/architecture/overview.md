@@ -39,7 +39,7 @@ Today, the repo already contains the monorepo skeleton for that shape:
 - KRX-first dashboard live/runtime keeps collector as the only KIS upstream owner
 - the smallest Kafka-backed live slice uses one broker-neutral dashboard topic (`market.dashboard-events.v1`) as the broadcast core
 - collector publishes KIS-formatted dashboard events into that topic and no longer consumes that same topic for browser delivery
-- `api/web` does not own the live KIS runtime; it requests collector start/stop for a symbol/market, consumes dashboard events directly from Kafka/Redpanda, and relays them to browsers over SSE
+- `api/web` does not own the live KIS runtime; it requests collector start/stop for a symbol/market-scope, consumes dashboard events directly from Kafka/Redpanda, and relays them to browsers over SSE
 - ClickHouse and richer processor stages remain outside this dashboard loop for now
 
 ## Design rules

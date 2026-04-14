@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, AsyncIterator
 from zoneinfo import ZoneInfo
 
@@ -240,6 +240,16 @@ DOMESTIC_REGULAR_SESSION_START = "090000"
 DOMESTIC_REGULAR_SESSION_END = "153000"
 
 
+def _parse_session_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if len(text) != 8 or not text.isdigit():
+        return None
+    try:
+        return datetime.strptime(text, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
 class KISProgramTradeClient:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -401,7 +411,7 @@ class KISProgramTradeClient:
 
         return schema["event"], frame.rename(columns=schema["rename_map"])
 
-    def fetch_intraday_chart(self, symbol: str, market: str, max_calls: int = 4) -> list[dict[str, Any]]:
+    def fetch_intraday_chart(self, symbol: str, market: str, max_calls: int = 20) -> dict[str, Any]:
         market = market.lower()
         market_div = {
             "krx": "J",
@@ -421,9 +431,11 @@ class KISProgramTradeClient:
             "custtype": "P",
         }
 
-        current_time = self._get_intraday_chart_anchor_time()
+        anchor_now = datetime.now(KST)
+        current_time = self._get_intraday_chart_anchor_time(anchor_now)
         rows: list[dict[str, Any]] = []
         seen_times: set[str] = set()
+        session_date = anchor_now.date()
 
         for _ in range(max_calls):
             params = {
@@ -448,6 +460,12 @@ class KISProgramTradeClient:
                 raise RuntimeError(body.get("msg1") or f"분봉 조회 실패: {body}")
 
             output = body.get("output2") or []
+            output1 = body.get("output1") if isinstance(body.get("output1"), dict) else {}
+            session_date = (
+                _parse_session_date(output1.get("stck_bsop_date"))
+                or _parse_session_date(output1.get("bsop_date"))
+                or session_date
+            )
             if not output:
                 break
 
@@ -469,7 +487,11 @@ class KISProgramTradeClient:
             current_time = next_dt.strftime("%H%M%S")
 
         rows.sort(key=lambda item: str(item.get("stck_cntg_hour") or ""))
-        return rows
+        return {
+            "rows": rows,
+            "session_date": session_date.isoformat(),
+            "anchor_time": current_time,
+        }
 
     @staticmethod
     def _get_intraday_chart_anchor_time(now: datetime | None = None) -> str:

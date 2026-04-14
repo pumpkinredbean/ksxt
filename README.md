@@ -20,7 +20,7 @@
 공개 저장소 기준으로 현재 확인 가능한 기능은 아래와 같습니다.
 
 - **KIS 기반 실시간 데이터 수집**
-- 종목 코드와 시장 기준 브라우저 SSE 스트림 구독 (`krx`, `nxt`, `total`)
+- 종목 코드와 시장 범위(scope) 기준 브라우저 SSE 스트림 구독 (`krx`, `nxt`, `total`)
 - 가격 차트 조회용 HTTP API
 - 브라우저에서 확인할 수 있는 기본 웹 화면
 - Docker Compose 기반 로컬 실행 환경
@@ -35,7 +35,7 @@
 사용자와 기여자가 이해해야 할 최소 구성만 정리하면 다음과 같습니다.
 
 - `collector`: KIS와 연결해 실시간 데이터를 받아오고, 대시보드 이벤트를 Redpanda로 발행하며, 제어용 구독 엔드포인트와 `/api/price-chart`, `/health`를 제공합니다.
-- `api-web`: Redpanda의 대시보드 이벤트를 소비해 브라우저 SSE로 전달하고, 웹 화면을 제공합니다.
+- `api-web`: Redpanda의 대시보드 이벤트를 소비해 브라우저 SSE로 전달하고, `src/web/` 정적 프런트엔드를 제공합니다.
 - `redpanda`: 실시간 이벤트를 전달하는 메시지 브로커입니다.
 - `processor`: Compose에 포함되어 있지만 아직 최소 수준의 서비스입니다.
 - `clickhouse`: 향후 저장/분석 확장을 위한 구성 요소로 포함되어 있습니다.
@@ -66,7 +66,7 @@ sequenceDiagram
     Note over C,R: collector and broker are long-running services
     B->>W: Open web page / request SSE or chart
     W->>R: Read dashboard events as downstream consumer
-    W->>C: Register or reuse symbol/market subscription
+    W->>C: Register or reuse symbol/market-scope subscription
     C->>S: Maintain upstream live market-data stream
     C->>R: Publish dashboard event
     R-->>W: Deliver matching dashboard event
@@ -131,7 +131,7 @@ python -m apps.collector.service
 확인할 수 있는 기본 주소:
 
 - `http://127.0.0.1:8001/health`
-- `http://127.0.0.1:8001/api/price-chart?symbol=005930&market=krx&interval=1`
+- `http://127.0.0.1:8001/api/price-chart?symbol=005930&scope=krx&interval=1`
 
 ### 5) 웹 앱 실행
 
@@ -142,6 +142,8 @@ uvicorn apps.api_web.app:app --reload
 브라우저 접속 주소:
 
 - `http://127.0.0.1:8000`
+
+`api-web`은 루트에서 `src/web/index.html`을 서빙하고, 같은 디렉터리의 정적 자산을 `/static`으로 제공합니다.
 
 ## Docker로 실행하기
 
