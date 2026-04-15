@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncIterator
@@ -97,14 +99,55 @@ class KISRealtimeClient:
         """Yield parsed realtime rows for multiple subscriptions over one websocket."""
 
         messages = await self.subscribe_many(subscriptions, auth)
-        bindings_by_tr_id = {message.binding.tr_id: message.binding for message in messages}
+        bindings_by_subscription_key = {(message.binding.tr_id, message.binding.tr_key): message.binding for message in messages}
 
         async with self.connect() as ws:
             for message in messages:
                 await ws.send(json.dumps(message.as_dict()))
 
             async for raw in ws:
-                parsed = await self._parse_many_message(raw=raw, bindings_by_tr_id=bindings_by_tr_id, ws=ws)
+                parsed = await self._parse_many_message(raw=raw, bindings_by_subscription_key=bindings_by_subscription_key, ws=ws)
+                if parsed is None:
+                    continue
+                for row in parsed:
+                    yield row
+
+    async def stream_subscriptions_rows_until(
+        self,
+        subscriptions: list[SubscriptionSpec],
+        auth: KISAuthMaterial,
+        *,
+        until: asyncio.Event,
+    ) -> AsyncIterator[KISRealtimeRow]:
+        """Yield rows until the caller requests a session refresh."""
+
+        messages = await self.subscribe_many(subscriptions, auth)
+        bindings_by_subscription_key = {(message.binding.tr_id, message.binding.tr_key): message.binding for message in messages}
+
+        async with self.connect() as ws:
+            for message in messages:
+                await ws.send(json.dumps(message.as_dict()))
+
+            while not until.is_set():
+                receive_task = asyncio.create_task(ws.recv())
+                refresh_task = asyncio.create_task(until.wait())
+                done, pending = await asyncio.wait(
+                    {receive_task, refresh_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+                if refresh_task in done and until.is_set():
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+                    return
+
+                raw = receive_task.result()
+                parsed = await self._parse_many_message(raw=raw, bindings_by_subscription_key=bindings_by_subscription_key, ws=ws)
                 if parsed is None:
                     continue
                 for row in parsed:
@@ -173,7 +216,7 @@ class KISRealtimeClient:
         self,
         *,
         raw: str | bytes,
-        bindings_by_tr_id: dict[str, KISSubscriptionBinding],
+        bindings_by_subscription_key: dict[tuple[str, str], KISSubscriptionBinding],
         ws: Any,
     ) -> list[KISRealtimeRow] | None:
         if isinstance(raw, bytes):
@@ -192,9 +235,41 @@ class KISRealtimeClient:
         if raw[0] not in {"0", "1"}:
             return None
 
-        _, tr_id, _, _ = raw.split("|", 3)
-        binding = bindings_by_tr_id.get(tr_id)
-        if binding is None:
+        _, tr_id, count_text, payload = raw.split("|", 3)
+        columns = resolve_realtime_columns(tr_id)
+        if not columns:
             return None
 
-        return await self._parse_message(raw=raw, binding=binding, ws=ws)
+        row_count = int(count_text)
+        values = payload.split("^")
+        row_width = len(columns)
+        if row_count > 0 and len(values) % row_count == 0:
+            row_width = len(values) // row_count
+
+        bindings: list[KISSubscriptionBinding] = []
+        symbol_column_index = 0
+        for start in range(0, len(values), max(row_width, 1)):
+            row_values = values[start:start + row_width]
+            if not row_values:
+                continue
+            symbol = row_values[symbol_column_index]
+            binding = bindings_by_subscription_key.get((tr_id, symbol))
+            if binding is None:
+                return None
+            bindings.append(binding)
+
+        if not bindings:
+            return None
+
+        parsed_rows: list[KISRealtimeRow] = []
+        seen_binding_keys: set[tuple[str, str]] = set()
+        for binding in bindings:
+            binding_key = (binding.tr_id, binding.tr_key)
+            if binding_key in seen_binding_keys:
+                continue
+            seen_binding_keys.add(binding_key)
+            rows = await self._parse_message(raw=raw, binding=binding, ws=ws)
+            if rows is None:
+                continue
+            parsed_rows.extend(row for row in rows if row.fields.get("MKSC_SHRN_ISCD") == binding.tr_key)
+        return parsed_rows or None

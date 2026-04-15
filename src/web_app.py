@@ -23,8 +23,17 @@ service_settings = load_service_settings("api-web")
 dashboard_broker = AsyncKafkaJsonBroker(service_settings.bootstrap_servers)
 collector_base_url = os.getenv("COLLECTOR_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 WEB_DIR = Path(__file__).resolve().parent / "web"
+ADMIN_DIST_DIR = WEB_DIR / "admin_dist"
 
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+app.mount("/admin/assets", StaticFiles(directory=ADMIN_DIST_DIR / "assets", check_dir=False), name="admin-assets")
+
+
+def _resolve_admin_index() -> Path:
+    admin_spa_index = ADMIN_DIST_DIR / "index.html"
+    if admin_spa_index.exists():
+        return admin_spa_index
+    return WEB_DIR / "admin.html"
 
 
 def _serialize_sse_lines(lines: list[str]) -> str:
@@ -75,6 +84,16 @@ async def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
 
 
+@app.get("/admin")
+async def admin_index() -> FileResponse:
+    return FileResponse(_resolve_admin_index())
+
+
+@app.get("/admin/")
+async def admin_index_slash() -> FileResponse:
+    return FileResponse(_resolve_admin_index())
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
@@ -114,6 +133,90 @@ async def price_chart(
         return JSONResponse({"error": str(exc)}, status_code=502)
     except requests.RequestException as exc:
         return JSONResponse({"error": f"collector price-chart relay failed: {exc}"}, status_code=502)
+
+
+async def _relay_collector_json(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_payload: dict[str, Any] | None = None,
+    timeout: int = 15,
+) -> JSONResponse:
+    try:
+        response = await asyncio.to_thread(
+            _collector_request,
+            method,
+            path,
+            params=params,
+            json=json_payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return JSONResponse(response.json())
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is not None:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {"error": response.text or str(exc)}
+            return JSONResponse(payload, status_code=response.status_code)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    except requests.RequestException as exc:
+        return JSONResponse({"error": f"collector relay failed: {exc}"}, status_code=502)
+
+
+@app.get("/api/admin/snapshot")
+async def admin_snapshot() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/snapshot")
+
+
+@app.get("/api/admin/instruments")
+async def admin_instrument_search(
+    query: str = Query(..., min_length=1),
+    scope: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    market: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+) -> JSONResponse:
+    try:
+        market_scope = _resolve_market_scope(scope=scope, market=market)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return await _relay_collector_json("GET", "/admin/instruments", params={"query": query, "scope": market_scope})
+
+
+@app.put("/api/admin/targets")
+async def admin_upsert_target(request: Request) -> JSONResponse:
+    return await _relay_collector_json("PUT", "/admin/targets", json_payload=await request.json())
+
+
+@app.delete("/api/admin/targets/{target_id}")
+async def admin_delete_target(target_id: str) -> JSONResponse:
+    return await _relay_collector_json("DELETE", f"/admin/targets/{target_id}")
+
+
+@app.get("/api/admin/events")
+async def admin_recent_events(
+    target_id: str | None = Query(None),
+    symbol: str | None = Query(None),
+    scope: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    market: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    event_name: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+) -> JSONResponse:
+    params: dict[str, Any] = {"limit": limit}
+    if target_id:
+        params["target_id"] = target_id
+    if symbol:
+        params["symbol"] = symbol
+    if event_name:
+        params["event_name"] = event_name
+    try:
+        if scope or market:
+            params["scope"] = _resolve_market_scope(scope=scope, market=market)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return await _relay_collector_json("GET", "/admin/events", params=params)
 
 
 @app.get("/stream")

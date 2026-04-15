@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime
 
-from .enums import AssetClass, InstrumentType, TradeSide, Venue
+from .enums import AssetClass, InstrumentType, RuntimeState, StorageBindingScope, TradeSide, Venue
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,3 +76,63 @@ class Provenance:
     raw_event_id: str | None = None
     trace_id: str | None = None
 
+
+@dataclass(frozen=True, slots=True)
+class InstrumentSearchResult:
+    """Stable search/registry surface for admin instrument discovery."""
+
+    instrument: InstrumentRef
+    display_name: str
+    market_scope: str
+    provider_instrument_id: str | None = None
+    venue_code: str | None = None
+    is_active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionTarget:
+    """Collector-owned declaration of what should be streamed upstream."""
+
+    target_id: str
+    instrument: InstrumentRef
+    market_scope: str
+    event_types: tuple[str, ...]
+    owner_service: str = "collector"
+    enabled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class StorageBinding:
+    """Mapping rule from incoming event types into a storage destination."""
+
+    binding_id: str
+    storage_backend: str
+    destination: str
+    event_types: tuple[str, ...]
+    scope: StorageBindingScope = StorageBindingScope.ALL_TARGETS
+    collection_target_id: str | None = None
+    enabled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionTargetStatus:
+    """Runtime status for one collection target, suitable for reactive monitoring."""
+
+    target_id: str
+    state: RuntimeState
+    observed_at: datetime
+    owner_service: str = "collector"
+    last_event_at: datetime | None = None
+    last_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatus:
+    """Service-level runtime status for the admin/control plane."""
+
+    component: str
+    state: RuntimeState
+    observed_at: datetime
+    active_collection_target_ids: tuple[str, ...] = ()
+    active_storage_binding_ids: tuple[str, ...] = ()
+    last_error: str | None = None

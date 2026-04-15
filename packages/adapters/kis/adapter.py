@@ -11,7 +11,7 @@ from packages.domain.models import InstrumentRef
 
 from .auth import KISAuthProvider
 from .config import KISSettings
-from .mappers import map_order_book_event, map_program_trade_event, map_trade_event
+from .mappers import KISRealtimeRow, map_order_book_event, map_program_trade_event, map_trade_event
 from .realtime import KISRealtimeClient
 
 
@@ -89,36 +89,46 @@ class KISMarketDataAdapter(MarketDataAdapter):
         *,
         market: str | None = None,
     ) -> AsyncIterator[MarketDataEvent]:
-        market = self._resolve_trade_market(instrument, market=market)
-        subscriptions = [
+        subscriptions = self.build_dashboard_subscriptions(instrument, market=market)
+
+        auth = await self.auth.issue_realtime_credentials()
+        async for row in self.realtime.stream_subscriptions_rows(subscriptions, auth):
+            yield self.map_dashboard_row(row)
+
+    def build_dashboard_subscriptions(
+        self,
+        instrument: InstrumentRef,
+        *,
+        market: str | None = None,
+    ) -> list[SubscriptionSpec]:
+        resolved_market = self._resolve_trade_market(instrument, market=market)
+        return [
             self.build_subscription_spec(
                 instrument=instrument,
                 channel_type=ChannelType.TRADE,
-                market=market,
+                market=resolved_market,
             ),
             self.build_subscription_spec(
                 instrument=instrument,
                 channel_type=ChannelType.ORDER_BOOK_SNAPSHOT,
-                market=market,
+                market=resolved_market,
             ),
             self.build_subscription_spec(
                 instrument=instrument,
                 channel_type=ChannelType.PROGRAM_TRADE,
-                market=market,
+                market=resolved_market,
             ),
         ]
 
-        auth = await self.auth.issue_realtime_credentials()
-        async for row in self.realtime.stream_subscriptions_rows(subscriptions, auth):
-            channel_type = row.binding.spec.channel_type
-            if channel_type == ChannelType.TRADE:
-                yield map_trade_event(row)
-                continue
-            if channel_type == ChannelType.ORDER_BOOK_SNAPSHOT:
-                yield map_order_book_event(row)
-                continue
-            if channel_type == ChannelType.PROGRAM_TRADE:
-                yield map_program_trade_event(row)
+    def map_dashboard_row(self, row: KISRealtimeRow) -> MarketDataEvent:
+        channel_type = row.binding.spec.channel_type
+        if channel_type == ChannelType.TRADE:
+            return map_trade_event(row)
+        if channel_type == ChannelType.ORDER_BOOK_SNAPSHOT:
+            return map_order_book_event(row)
+        if channel_type == ChannelType.PROGRAM_TRADE:
+            return map_program_trade_event(row)
+        raise ValueError(f"unsupported dashboard channel type: {channel_type}")
 
     def _resolve_trade_market(self, instrument: InstrumentRef, *, market: str | None = None) -> str:
         if market is not None:

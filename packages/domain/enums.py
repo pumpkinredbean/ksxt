@@ -78,3 +78,21 @@ class SessionState(StrEnum):
     HALTED = "halted"
     CLOSED = "closed"
     UNKNOWN = "unknown"
+
+
+class RuntimeState(StrEnum):
+    """Lifecycle states for collector/admin control-plane runtime reporting."""
+
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    DEGRADED = "degraded"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+
+class StorageBindingScope(StrEnum):
+    """Scope labels for mapping incoming events into storage destinations."""
+
+    ALL_TARGETS = "all_targets"
+    COLLECTION_TARGET = "collection_target"

@@ -36,6 +36,8 @@ services:
       context: .
       dockerfile: docker/python-service.Dockerfile
     command: python -m apps.collector.service
+    volumes:
+      - .:/app
     env_file:
       - .env
     environment:
@@ -74,6 +76,8 @@ services:
       context: .
       dockerfile: docker/python-service.Dockerfile
     command: uvicorn apps.api_web.app:app --host 0.0.0.0 --port 8000
+    volumes:
+      - .:/app
     env_file:
       - .env
     environment:
