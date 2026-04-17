@@ -39,6 +39,9 @@ class ControlPlaneSnapshot:
     storage_bindings: tuple[StorageBinding, ...] = ()
     runtime_status: tuple[RuntimeStatus, ...] = ()
     collection_target_status: tuple[CollectionTargetStatus, ...] = ()
+    # KSXT realtime session-level state (IDLE/CONNECTING/HEALTHY/DEGRADED/CLOSED).
+    # Surfaces a separate admin-UI banner from the collector_offline state.
+    session_state: str | None = None
     schema_version: str = "v1"
 
 

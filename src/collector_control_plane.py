@@ -6,6 +6,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -17,6 +18,16 @@ from packages.domain.models import CollectionTarget, CollectionTargetStatus, Ins
 
 
 SUPPORTED_MARKET_SCOPES = {"krx", "nxt", "total"}
+
+
+@dataclass(frozen=True, slots=True)
+class PermanentFailureMeta:
+    """Captures KSXT KISSubscriptionError metadata for admin UI display."""
+
+    reason: str
+    rt_cd: str | None = None
+    msg: str | None = None
+    attempts: int | None = None
 
 EVENT_TYPE_ALIASES: dict[str, str] = {
     "trade": "trade",
@@ -63,12 +74,17 @@ class CollectorControlPlaneService:
         self._lock = asyncio.Lock()
         self._targets: dict[str, CollectionTarget] = {}
         self._target_errors: dict[str, str | None] = {}
+        self._target_permanent_failures: dict[str, PermanentFailureMeta] = {}
         self._last_search_results: tuple[InstrumentSearchResult, ...] = ()
         self._service_state = RuntimeState.STARTING
         self._last_service_error: str | None = None
         self._last_event_at_by_target: dict[str, datetime] = {}
         self._recent_events: deque[RecentRuntimeEvent] = deque(maxlen=250)
         self._event_subscribers: list[asyncio.Queue[RecentRuntimeEvent]] = []
+        # Meta subscribers receive SSE-ready tuples (event_type, payload) for
+        # session-level signals (session_recovered, session_state_changed).
+        self._meta_subscribers: list[asyncio.Queue[tuple[str, dict[str, Any]]]] = []
+        self._session_state: str | None = None
 
     async def mark_running(self) -> None:
         async with self._lock:
@@ -88,15 +104,18 @@ class CollectorControlPlaneService:
             targets = tuple(self._targets.values())
             search_results = self._last_search_results
             target_errors = dict(self._target_errors)
+            permanent_failures = dict(self._target_permanent_failures)
             service_state = self._service_state
             service_error = self._last_service_error
             last_event_at_by_target = dict(self._last_event_at_by_target)
+            session_state = self._session_state
 
         statuses = tuple(
             self._build_target_status(
                 target,
                 target_errors.get(target.target_id),
                 last_event_at=last_event_at_by_target.get(target.target_id),
+                permanent=permanent_failures.get(target.target_id),
             )
             for target in targets
         )
@@ -123,6 +142,7 @@ class CollectorControlPlaneService:
                 ),
             ),
             collection_target_status=statuses,
+            session_state=session_state,
         )
 
     async def search_instruments(self, *, query: str, market_scope: str | None = None, limit: int = 10) -> tuple[InstrumentSearchResult, ...]:
@@ -173,9 +193,11 @@ class CollectorControlPlaneService:
         async with self._lock:
             self._targets[resolved_target_id] = target
             self._target_errors[resolved_target_id] = None
+            self._target_permanent_failures.pop(resolved_target_id, None)
             for duplicate_target_id in duplicate_target_ids:
                 self._targets.pop(duplicate_target_id, None)
                 self._target_errors.pop(duplicate_target_id, None)
+                self._target_permanent_failures.pop(duplicate_target_id, None)
 
         for duplicate_target_id in duplicate_target_ids:
             with contextlib.suppress(Exception):
@@ -216,6 +238,7 @@ class CollectorControlPlaneService:
             target = self._targets.pop(resolved_target_id, None)
             self._target_errors.pop(resolved_target_id, None)
             self._last_event_at_by_target.pop(resolved_target_id, None)
+            self._target_permanent_failures.pop(resolved_target_id, None)
 
         if target is None:
             return {"target_id": resolved_target_id, "status": "not_found"}
@@ -335,6 +358,64 @@ class CollectorControlPlaneService:
             if cleared_any:
                 self._last_service_error = None
 
+    async def clear_all_publication_errors(self) -> None:
+        """Clear transient per-target error state across the board.
+
+        Called when the KSXT session reports ``on_recovery`` so stale errors
+        set by a previous cycle failure are cleared before fresh events start
+        arriving.  Permanent failures are intentionally left untouched.
+        """
+        async with self._lock:
+            for target_id in list(self._target_errors.keys()):
+                if self._target_errors.get(target_id):
+                    self._target_errors[target_id] = None
+            self._last_service_error = None
+
+    async def mark_target_permanent_failure(self, *, target_id: str, reason: str, rt_cd: str | None, msg: str | None, attempts: int | None) -> None:
+        resolved = target_id.strip()
+        async with self._lock:
+            meta = PermanentFailureMeta(reason=reason, rt_cd=rt_cd, msg=msg, attempts=attempts)
+            self._target_permanent_failures[resolved] = meta
+            # Mirror into last_error so existing panels still show something.
+            self._target_errors[resolved] = f"permanent_failure:{reason}"
+
+    async def clear_target_permanent_failure(self, *, target_id: str) -> None:
+        resolved = target_id.strip()
+        async with self._lock:
+            self._target_permanent_failures.pop(resolved, None)
+            if self._target_errors.get(resolved, "").startswith("permanent_failure:"):
+                self._target_errors[resolved] = None
+
+    async def mark_session_state(self, *, state: str | None) -> None:
+        async with self._lock:
+            self._session_state = state
+            subscribers = list(self._meta_subscribers)
+        payload = {"state": state, "observed_at": datetime.utcnow().isoformat()}
+        for queue in subscribers:
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(("session_state_changed", payload))
+
+    async def broadcast_session_recovered(self) -> None:
+        async with self._lock:
+            subscribers = list(self._meta_subscribers)
+        payload = {"observed_at": datetime.utcnow().isoformat()}
+        for queue in subscribers:
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(("session_recovered", payload))
+
+    @asynccontextmanager
+    async def subscribe_meta_events(self) -> AsyncIterator[asyncio.Queue[tuple[str, dict[str, Any]]]]:
+        """Subscribe to session-level meta events (session_recovered, session_state_changed)."""
+        queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=100)
+        async with self._lock:
+            self._meta_subscribers.append(queue)
+        try:
+            yield queue
+        finally:
+            async with self._lock:
+                with contextlib.suppress(ValueError):
+                    self._meta_subscribers.remove(queue)
+
     async def recent_events(
         self,
         *,
@@ -409,9 +490,11 @@ class CollectorControlPlaneService:
     def _storage_bindings(self) -> tuple[StorageBinding, ...]:
         return ()
 
-    def _build_target_status(self, target: CollectionTarget, last_error: str | None, *, last_event_at: datetime | None = None) -> CollectionTargetStatus:
+    def _build_target_status(self, target: CollectionTarget, last_error: str | None, *, last_event_at: datetime | None = None, permanent: PermanentFailureMeta | None = None) -> CollectionTargetStatus:
         is_active = self._is_publication_active(target.target_id)
-        if last_error:
+        if permanent is not None:
+            state = RuntimeState.ERROR
+        elif last_error:
             state = RuntimeState.ERROR
         elif target.enabled and is_active:
             state = RuntimeState.RUNNING
@@ -424,6 +507,11 @@ class CollectorControlPlaneService:
             observed_at=datetime.utcnow(),
             last_event_at=last_event_at,
             last_error=last_error,
+            permanent_failure=permanent is not None,
+            failure_reason=permanent.reason if permanent is not None else None,
+            failure_rt_cd=permanent.rt_cd if permanent is not None else None,
+            failure_msg=permanent.msg if permanent is not None else None,
+            failure_attempts=permanent.attempts if permanent is not None else None,
         )
 
     @staticmethod

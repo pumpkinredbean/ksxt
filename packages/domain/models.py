@@ -124,6 +124,14 @@ class CollectionTargetStatus:
     owner_service: str = "collector"
     last_event_at: datetime | None = None
     last_error: str | None = None
+    # Permanent failure metadata from KSXT KISSubscriptionError.  When
+    # permanent_failure is True the collector will not retry this target;
+    # admin UI renders an explicit "영구 실패" badge.
+    permanent_failure: bool = False
+    failure_reason: str | None = None
+    failure_rt_cd: str | None = None
+    failure_msg: str | None = None
+    failure_attempts: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

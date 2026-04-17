@@ -1,282 +1,152 @@
+"""Minimal compile-level tests for the KSXT-backed CollectorRuntime.
+
+The legacy WS-managed runtime tests were removed as part of hub-B (collector
+migration to KSXT ``KISRealtimeSession``).  Deep behavioural coverage of the
+KSXT session is owned by the ksxt repo; here we only assert that the hub
+module still imports and exposes the public surface the service layer needs.
+
+hub-E will re-introduce integration-level coverage against the KSXT session.
+
+One behavioural regression probe is retained (restored under hub-B H4): the
+session-recovery path — when KSXT's ``on_recovery`` callback fires, the
+control plane must clear transient publication errors and broadcast a
+``session_recovered`` meta event to SSE subscribers.
+"""
 from __future__ import annotations
 
 import asyncio
 import unittest
-from datetime import datetime, timezone
-from types import SimpleNamespace
-
-from apps.collector.runtime import CollectorRuntime, _BASE_RECONNECT_DELAY, _MAX_RECONNECT_DELAY
-from packages.contracts import ChannelType, EventType, SubscriptionSpec
-from packages.domain.enums import Venue
-from packages.domain.models import InstrumentRef
-from packages.adapters.kis.mappers import KISSubscriptionBinding
-from packages.adapters.kis.realtime import KISRealtimeClient
 
 
-class _FakeAuthProvider:
-    async def issue_realtime_credentials(self) -> object:
-        return object()
+class CollectorRuntimeImportTests(unittest.TestCase):
+    def test_runtime_module_imports_ksxt_session(self) -> None:
+        # Bare import — the runtime module should not pull the legacy
+        # packages.adapters.kis websocket adapter anymore.
+        from apps.collector import runtime as runtime_module
+
+        self.assertTrue(hasattr(runtime_module, "CollectorRuntime"))
+        self.assertTrue(hasattr(runtime_module, "SUPPORTED_MARKET_SCOPES"))
+        # Confirm the legacy WS supervisor symbols have been removed — these
+        # are exit criteria from the hub-B migration packet.
+        for removed in (
+            "_run_upstream_session",
+            "_BASE_RECONNECT_DELAY",
+            "_MAX_RECONNECT_DELAY",
+            "_broadcast_recovery",
+            "_broadcast_failure",
+        ):
+            self.assertFalse(
+                hasattr(runtime_module, removed),
+                f"{removed} must be removed from collector runtime (hub-B exit criteria)",
+            )
+
+    def test_runtime_uses_ksxt_session(self) -> None:
+        from ksxt import KISRealtimeSession, RealtimeState
+
+        # Sanity: public exports referenced by the runtime exist.
+        self.assertTrue(hasattr(KISRealtimeSession, "subscribe"))
+        self.assertTrue(hasattr(RealtimeState, "HEALTHY"))
 
 
-class _FakeRealtimeClient:
-    def __init__(self) -> None:
-        self.call_count = 0
-        self.max_active_sessions = 0
-        self._active_sessions = 0
-        self.subscription_batches: list[list[SubscriptionSpec]] = []
-        # Set to a non-None Exception to make the next session raise instead of stream.
-        self.fail_next: Exception | None = None
+class SessionRecoveryPropagationTests(unittest.IsolatedAsyncioTestCase):
+    """Restored hub-B regression probe (H4 decision).
 
-    async def stream_subscriptions_rows_until(self, subscriptions, auth, *, until):
-        self.call_count += 1
-        self._active_sessions += 1
-        self.max_active_sessions = max(self.max_active_sessions, self._active_sessions)
-        self.subscription_batches.append(list(subscriptions))
-        exc = self.fail_next
-        self.fail_next = None
-        try:
-            if exc is not None:
-                raise exc
-            while not until.is_set():
-                await asyncio.sleep(0.01)
-            if False:
-                yield None
-        finally:
-            self._active_sessions -= 1
+    Original name (pre-hub-B):
+      ``test_session_failure_broadcasts_to_all_targets_and_recovery_clears_errors``
 
-
-class _FakeAdapter:
-    def __init__(self) -> None:
-        self.auth = _FakeAuthProvider()
-        self.realtime = _FakeRealtimeClient()
-
-    def build_subscription_spec(self, instrument, channel_type, **options):
-        return SubscriptionSpec(instrument=instrument, channel_type=channel_type, options=dict(options))
-
-    def map_dashboard_row(self, row):
-        return SimpleNamespace(
-            event_type=EventType.TRADE,
-            raw_payload={"fields": {"STCK_CNTG_HOUR": "090000", "STCK_PRPR": "1000"}},
-            occurred_at=datetime.now(timezone.utc),
-            received_at=datetime.now(timezone.utc),
-        )
-
-
-class _FakeChartClient:
-    async def aclose(self) -> None:
-        return None
-
-
-def _make_runtime(
-    *,
-    on_event=None,
-    on_failure=None,
-    on_recovery=None,
-) -> tuple[CollectorRuntime, _FakeAdapter]:
-    """Build a CollectorRuntime wired with a _FakeAdapter for testing."""
-    runtime = CollectorRuntime(
-        SimpleNamespace(ws_url="ws://example", rest_url="https://example", app_key="x", app_secret="y"),
-        on_event=on_event,
-        on_failure=on_failure,
-        on_recovery=on_recovery,
-    )
-    fake_adapter = _FakeAdapter()
-    runtime._adapter = fake_adapter
-    runtime._chart_client = _FakeChartClient()
-    return runtime, fake_adapter
-
-
-async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met before timeout")
-
-
-class CollectorRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_multiple_targets_share_one_upstream_task(self) -> None:
-        events: list[dict[str, object]] = []
-        failures: list[dict[str, object]] = []
-        runtime, fake_adapter = _make_runtime(
-            on_event=lambda **payload: _capture(events, payload),
-            on_failure=lambda **payload: _capture(failures, payload),
-        )
-
-        await runtime.register_target(owner_id="target-1", symbol="005930", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 1)
-        self.assertEqual(1, len(fake_adapter.realtime.subscription_batches[-1]))
-
-        await runtime.register_target(owner_id="target-2", symbol="000660", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 2)
-        self.assertEqual(2, len(fake_adapter.realtime.subscription_batches[-1]))
-        self.assertEqual(1, fake_adapter.realtime.max_active_sessions)
-        self.assertTrue(runtime.is_target_active("target-1"))
-        self.assertTrue(runtime.is_target_active("target-2"))
-
-        await runtime.aclose()
-        self.assertEqual([], events)
-        self.assertEqual([], failures)
-
-    async def test_remove_target_while_live_refreshes_without_concurrent_sessions(self) -> None:
-        """Unregistering a target while connected rebuilds the session with the remaining symbol only."""
-        runtime, fake_adapter = _make_runtime()
-
-        await runtime.register_target(owner_id="owner-a", symbol="005930", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 1)
-        await runtime.register_target(owner_id="owner-b", symbol="000660", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 2)
-        self.assertEqual(2, len(fake_adapter.realtime.subscription_batches[-1]))
-
-        await runtime.unregister_target(owner_id="owner-b")
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 3)
-
-        # Only one symbol left in the last subscription batch.
-        self.assertEqual(1, len(fake_adapter.realtime.subscription_batches[-1]))
-        # Never had more than one concurrent session.
-        self.assertEqual(1, fake_adapter.realtime.max_active_sessions)
-
-        await runtime.aclose()
-
-    async def test_update_event_types_while_live_refreshes_session(self) -> None:
-        """Re-registering an owner with different event types triggers a clean session rebuild."""
-        runtime, fake_adapter = _make_runtime()
-
-        await runtime.register_target(owner_id="owner-a", symbol="005930", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 1)
-        first_batch = fake_adapter.realtime.subscription_batches[0]
-        self.assertEqual(1, len(first_batch))
-
-        # Re-register the same owner with an additional event type.
-        await runtime.register_target(
-            owner_id="owner-a",
-            symbol="005930",
-            market_scope="krx",
-            event_types=["trade", "order_book_snapshot"],
-        )
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 2)
-        second_batch = fake_adapter.realtime.subscription_batches[1]
-        # Two channel subscriptions for the same symbol now.
-        self.assertEqual(2, len(second_batch))
-        # No concurrent sessions at any point.
-        self.assertEqual(1, fake_adapter.realtime.max_active_sessions)
-
-        await runtime.aclose()
+    This rewrite targets the KSXT ``KISRealtimeSession`` state transitions
+    HEALTHY → DEGRADED → HEALTHY and the ``on_recovery`` hook. We stub the
+    session so no network / private ``_registry`` access is required; the
+    goal is to pin the contract that ``CollectorControlPlaneService``'s
+    publication-error state is cleared when ``on_recovery`` fires and that
+    a ``session_recovered`` meta event is delivered to subscribers.
+    """
 
     async def test_session_failure_broadcasts_to_all_targets_and_recovery_clears_errors(self) -> None:
-        """Session failure fans out errors; on_recovery fires for each registered stream key after rebuild."""
-        failures: list[dict[str, object]] = []
-        recoveries: list[dict[str, object]] = []
-        runtime, fake_adapter = _make_runtime(
-            on_failure=lambda **payload: _capture(failures, payload),
-            on_recovery=lambda **payload: _capture(recoveries, payload),
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        from src.collector_control_plane import CollectorControlPlaneService
+
+        started: list[dict[str, object]] = []
+        stopped: list[dict[str, object]] = []
+        active_owners: set[str] = set()
+
+        async def fake_start(**kwargs: object) -> dict[str, object]:
+            started.append(kwargs)
+            active_owners.add(str(kwargs["owner_id"]))
+            return {"subscription_id": kwargs["owner_id"], "status": "started"}
+
+        async def fake_stop(*, subscription_id: str) -> dict[str, object]:
+            stopped.append({"subscription_id": subscription_id})
+            active_owners.discard(subscription_id)
+            return {"subscription_id": subscription_id, "status": "stopped"}
+
+        service = CollectorControlPlaneService(
+            service_name="collector",
+            default_symbol="005930",
+            default_market_scope="krx",
+            start_publication=fake_start,
+            stop_publication=fake_stop,
+            is_publication_active=lambda owner_id: owner_id in active_owners,
         )
 
-        await runtime.register_target(owner_id="owner-a", symbol="005930", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 1)
-        await runtime.register_target(owner_id="owner-b", symbol="000660", market_scope="krx", event_types=["trade"])
-        await _wait_for(lambda: fake_adapter.realtime.call_count == 2)
-
-        # Inject a failure so the next reconnect attempt raises.
-        fake_adapter.realtime.fail_next = RuntimeError("upstream disconnected")
-        # Trigger refresh so the running session ends and a new one starts (and fails).
-        runtime._refresh_event.set()
-
-        await _wait_for(lambda: len(failures) >= 2, timeout=2.0)
-        # Both registered stream keys should receive a failure notification.
-        failed_symbols = {f["symbol"] for f in failures}
-        self.assertIn("005930", failed_symbols)
-        self.assertIn("000660", failed_symbols)
-
-        # The subsequent successful reconnect should broadcast recovery for both keys.
-        await _wait_for(lambda: fake_adapter.realtime.call_count >= 4, timeout=3.0)
-        await _wait_for(lambda: len(recoveries) >= 2, timeout=2.0)
-        recovered_symbols = {r["symbol"] for r in recoveries}
-        self.assertIn("005930", recovered_symbols)
-        self.assertIn("000660", recovered_symbols)
-
-        await runtime.aclose()
-
-    async def test_reconnect_backoff_constants_are_bounded(self) -> None:
-        """Verify the backoff constants are within expected bounds so repeated failures don't spin fast."""
-        self.assertGreaterEqual(_BASE_RECONNECT_DELAY, 1.0, "_BASE_RECONNECT_DELAY must be at least 1 second")
-        self.assertLessEqual(_MAX_RECONNECT_DELAY, 60.0, "_MAX_RECONNECT_DELAY must be at most 60 seconds")
-        self.assertLess(_BASE_RECONNECT_DELAY, _MAX_RECONNECT_DELAY, "BASE must be less than MAX")
-
-    async def test_reconnect_backoff_grows_and_caps(self) -> None:
-        """Simulate the backoff accumulation logic used inside _run_upstream_session."""
-        delay = 0.0
-        delays = []
-        for _ in range(10):
-            delay = min(
-                _BASE_RECONNECT_DELAY if delay == 0.0 else delay * 2,
-                _MAX_RECONNECT_DELAY,
-            )
-            delays.append(delay)
-
-        self.assertEqual(delays[0], _BASE_RECONNECT_DELAY)
-        self.assertTrue(all(d <= _MAX_RECONNECT_DELAY for d in delays), f"All delays must be ≤ {_MAX_RECONNECT_DELAY}: {delays}")
-        self.assertEqual(delays[-1], _MAX_RECONNECT_DELAY, "Delay must saturate at MAX after enough doublings")
-
-class KISRealtimeClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_realtime_rows_bind_by_symbol_with_shared_tr_id(self) -> None:
-        client = KISRealtimeClient(SimpleNamespace(ws_url="ws://example"))
-        instrument_a = InstrumentRef(symbol="005930", instrument_id="005930", venue=Venue.KRX)
-        instrument_b = InstrumentRef(symbol="000660", instrument_id="000660", venue=Venue.KRX)
-        binding_a = KISSubscriptionBinding(
-            spec=SubscriptionSpec(instrument=instrument_a, channel_type=ChannelType.TRADE, options={"market": "krx"}),
-            tr_id="H0STCNT0",
-            tr_key="005930",
-            market="krx",
+        # Seed two targets (HEALTHY baseline, like KSXT session state HEALTHY).
+        upsert_a = await service.upsert_target(
+            target_id=None,
+            symbol="005930",
+            market_scope="krx",
+            event_types=["trade"],
+            enabled=True,
         )
-        binding_b = KISSubscriptionBinding(
-            spec=SubscriptionSpec(instrument=instrument_b, channel_type=ChannelType.TRADE, options={"market": "krx"}),
-            tr_id="H0STCNT0",
-            tr_key="000660",
-            market="krx",
+        upsert_b = await service.upsert_target(
+            target_id=None,
+            symbol="000660",
+            market_scope="krx",
+            event_types=["trade"],
+            enabled=True,
         )
+        target_id_a = upsert_a["target"].target_id  # type: ignore[attr-defined]
+        target_id_b = upsert_b["target"].target_id  # type: ignore[attr-defined]
 
-        raw = "0|H0STCNT0|2|005930^090000^1000^0^0^0^0^0^0^0^0^0^10^10^10000^000660^090001^2000^0^0^0^0^0^0^0^0^0^20^20^20000"
-        rows = await client._parse_many_message(
-            raw=raw,
-            bindings_by_subscription_key={("H0STCNT0", "005930"): binding_a, ("H0STCNT0", "000660"): binding_b},
-            ws=SimpleNamespace(pong=_noop_pong),
+        # Simulate KSXT session HEALTHY → DEGRADED: the runtime fans a
+        # publication failure out to each (symbol, market_scope) pair, as
+        # would happen when the upstream session errors mid-stream.
+        await service.record_publication_failure(
+            symbol="005930", market_scope="krx", error="upstream disconnected"
         )
+        await service.record_publication_failure(
+            symbol="000660", market_scope="krx", error="upstream disconnected"
+        )
+        snapshot_degraded = await service.snapshot()
+        statuses_degraded = {s.target_id: s for s in snapshot_degraded.collection_target_status}
+        self.assertEqual(statuses_degraded[target_id_a].last_error, "upstream disconnected")
+        self.assertEqual(statuses_degraded[target_id_b].last_error, "upstream disconnected")
 
-        assert rows is not None
-        self.assertEqual(["005930", "000660"], [row.binding.tr_key for row in rows])
-        self.assertEqual(["005930", "000660"], [row.fields["MKSC_SHRN_ISCD"] for row in rows])
+        # Now simulate KSXT session DEGRADED → HEALTHY via on_recovery
+        # callback path: CollectorDashboardService._handle_runtime_recovery
+        # calls clear_all_publication_errors() + broadcast_session_recovered().
+        async with service.subscribe_meta_events() as meta_queue:
+            await service.clear_all_publication_errors()
+            await service.broadcast_session_recovered()
 
-    def test_connect_disables_protocol_ping(self) -> None:
-        """KIS uses app-level PINGPONG; protocol-level ping must be disabled to avoid keepalive timeout."""
-        import inspect
-        client = KISRealtimeClient(SimpleNamespace(ws_url="ws://example"))
-        # Inspect the connect() call_args by examining the source — we verify the constants
-        # exported from the module rather than actually opening a socket.
-        import websockets
-        # The connect() method should pass ping_interval=None and ping_timeout=None.
-        # We can't call client.connect() without a real server, so we verify the method
-        # body returns a context manager built without protocol-level ping args.
-        import ast, textwrap
-        source = textwrap.dedent(inspect.getsource(client.connect))
-        tree = ast.parse(source)
-        found_ping_interval_none = False
-        found_ping_timeout_none = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.keyword):
-                if node.arg == "ping_interval" and isinstance(node.value, ast.Constant) and node.value.value is None:
-                    found_ping_interval_none = True
-                if node.arg == "ping_timeout" and isinstance(node.value, ast.Constant) and node.value.value is None:
-                    found_ping_timeout_none = True
-        self.assertTrue(found_ping_interval_none, "connect() must pass ping_interval=None to disable protocol ping")
-        self.assertTrue(found_ping_timeout_none, "connect() must pass ping_timeout=None to disable protocol ping")
+            # Recovery must be delivered as a `session_recovered` meta SSE
+            # event and MUST NOT pollute the market-data events feed.
+            meta_event = await asyncio.wait_for(meta_queue.get(), timeout=1.0)
+
+        self.assertEqual(meta_event[0], "session_recovered")
+        self.assertIn("observed_at", meta_event[1])
+
+        snapshot_recovered = await service.snapshot()
+        statuses_recovered = {s.target_id: s for s in snapshot_recovered.collection_target_status}
+        self.assertIsNone(statuses_recovered[target_id_a].last_error)
+        self.assertIsNone(statuses_recovered[target_id_b].last_error)
+
+        # Recent events queue must NOT have the meta event — it travels
+        # exclusively on the meta channel.
+        events_snapshot = await service.recent_events(limit=50)
+        self.assertEqual(events_snapshot["recent_events"], ())
 
 
-async def _capture(bucket: list[dict[str, object]], payload: dict[str, object]) -> None:
-    bucket.append(payload)
-
-
-async def _noop_pong(_raw) -> None:
-    return None
-
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

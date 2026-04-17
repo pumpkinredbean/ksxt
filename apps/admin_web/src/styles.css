@@ -186,6 +186,32 @@ body {
   border-bottom: 1px solid #fde68a;
 }
 
+/* KSXT session DEGRADED is conceptually distinct from collector_offline; it
+   may co-exist with .degraded and is rendered with a stronger red tone to
+   signal that the realtime upstream is actively failing even though the
+   collector container itself is running. */
+.global-banner.session-degraded {
+  background: #fef2f2;
+  color: #991b1b;
+  border-bottom: 1px solid #fecaca;
+}
+
+/* Transient flash when the KSXT session reports on_recovery.  Auto-hidden
+   from the DOM by App state after ~3s; here we only style the visible
+   window. */
+.global-banner.session-recovered {
+  background: #ecfdf5;
+  color: #065f46;
+  border-bottom: 1px solid #a7f3d0;
+}
+
+/* Permanent-failure row: 항상 표시되는 빨강 계열 배지 + summary line.
+   Hover tooltip (title attribute) reveals reason/rt_cd/msg/attempts detail. */
+.perm-failure-cell .sub {
+  margin-top: 4px;
+  color: #991b1b;
+}
+
 /* ── Main ─────────────────────────────────────────────────────────── */
 /* Main content area scrolls internally; fills the remaining 1fr height.  */
 /* align-self:stretch pins it to the grid cell so it never pushes taller. */

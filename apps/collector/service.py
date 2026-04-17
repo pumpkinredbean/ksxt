@@ -4,11 +4,63 @@ import asyncio
 import contextlib
 import json
 import logging
+import logging.config
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
+
+
+def _setup_logging() -> None:
+    """Configure structured logging for collector process.
+
+    Attaches a single stderr handler to ``apps.collector.*`` and ``ksxt.*``
+    loggers so subscribe/recovery/permanent-failure events are always visible
+    regardless of uvicorn access-log configuration. Honors ``LOG_LEVEL`` env.
+    Idempotent — dictConfig replaces any prior configuration.
+    """
+    level = (os.getenv("LOG_LEVEL") or "INFO").strip().upper() or "INFO"
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "hub": {
+                    "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+                    "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+                }
+            },
+            "handlers": {
+                "hub_stderr": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "hub",
+                    "stream": "ext://sys.stderr",
+                }
+            },
+            "loggers": {
+                "apps.collector": {
+                    "handlers": ["hub_stderr"],
+                    "level": level,
+                    "propagate": False,
+                },
+                "ksxt": {
+                    "handlers": ["hub_stderr"],
+                    "level": level,
+                    "propagate": False,
+                },
+                "src.collector_control_plane": {
+                    "handlers": ["hub_stderr"],
+                    "level": level,
+                    "propagate": False,
+                },
+            },
+        }
+    )
+
+
+_setup_logging()
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -74,6 +126,8 @@ class CollectorDashboardService:
             on_event=self._handle_runtime_event,
             on_failure=self._handle_runtime_failure,
             on_recovery=self._handle_runtime_recovery,
+            on_session_state_change=self._handle_runtime_session_state,
+            on_permanent_failure=self._handle_runtime_permanent_failure,
         )
         self._broker = AsyncKafkaJsonBroker(settings.bootstrap_servers)
         self._publisher = CollectorPublisher(self._broker)
@@ -206,6 +260,10 @@ class CollectorDashboardService:
         """Return an async context manager yielding a push queue of RecentRuntimeEvent objects."""
         return self._control_plane.subscribe_events()
 
+    def subscribe_meta_events(self):
+        """Return an async context manager yielding session-level meta events for SSE flash."""
+        return self._control_plane.subscribe_meta_events()
+
     def is_publication_active(self, owner_id: str) -> bool:
         return self._collector_runtime.is_target_active(owner_id)
 
@@ -264,11 +322,47 @@ class CollectorDashboardService:
             extra={"symbol": symbol, "market_scope": market_scope},
         )
 
-    async def _handle_runtime_recovery(self, *, symbol: str, market_scope: str) -> None:
-        """Clear stale error state for a symbol/market_scope when a new session starts."""
-        await self._control_plane.clear_publication_errors(
-            symbol=symbol,
-            market_scope=market_scope,
+    async def _handle_runtime_recovery(self) -> None:
+        """Clear transient error state across all targets and flash a meta event to admin UI."""
+        await self._control_plane.clear_all_publication_errors()
+        await self._control_plane.broadcast_session_recovered()
+
+    async def _handle_runtime_session_state(self, *, state: str, previous: str) -> None:
+        """Forward KSXT session state transitions into the admin control plane."""
+        await self._control_plane.mark_session_state(state=state)
+
+    async def _handle_runtime_permanent_failure(
+        self,
+        *,
+        symbol: str,
+        market_scope: str,
+        event_name: str,
+        owner_ids: tuple[str, ...],
+        reason: str,
+        rt_cd: str | None,
+        msg: str | None,
+        attempts: int | None,
+    ) -> None:
+        """Mark every target that owns this channel as permanently failed."""
+        for owner_id in owner_ids:
+            await self._control_plane.mark_target_permanent_failure(
+                target_id=owner_id,
+                reason=reason,
+                rt_cd=rt_cd,
+                msg=msg,
+                attempts=attempts,
+            )
+        logger.error(
+            "collector subscription permanently failed",
+            extra={
+                "symbol": symbol,
+                "market_scope": market_scope,
+                "event_name": event_name,
+                "reason": reason,
+                "rt_cd": rt_cd,
+                "msg": msg,
+                "attempts": attempts,
+            },
         )
 
     def _build_subscription(self, *, symbol: str, market_scope: str) -> DashboardSubscription:
@@ -407,16 +501,45 @@ async def admin_events_stream(
             known_event_names = set()
 
         # Stream new events as they are pushed by record_runtime_event().
-        async with dashboard_service.subscribe_events() as queue:
+        async with dashboard_service.subscribe_events() as queue, dashboard_service.subscribe_meta_events() as meta_queue:
             while True:
                 if await request.is_disconnected():
                     return
+                event_task = asyncio.create_task(queue.get())
+                meta_task = asyncio.create_task(meta_queue.get())
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
+                    done, _ = await asyncio.wait(
+                        {event_task, meta_task},
+                        timeout=15.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    event_task.cancel()
+                    meta_task.cancel()
+                    raise
+
+                if not done:
+                    event_task.cancel()
+                    meta_task.cancel()
                     # Send a keep-alive comment to prevent proxy/browser timeouts.
                     yield ": heartbeat\n\n"
                     continue
+
+                # Meta events (session_recovered, session_state_changed) are
+                # emitted as named SSE events separate from the `events`
+                # channel so the admin UI can flash them without polluting
+                # the market-data event table.
+                if meta_task in done:
+                    meta_type, meta_payload = meta_task.result()
+                    yield f"event: {meta_type}\ndata: {json.dumps(meta_payload, ensure_ascii=False, default=str)}\n\n"
+                else:
+                    meta_task.cancel()
+
+                if event_task not in done:
+                    event_task.cancel()
+                    continue
+
+                event = event_task.result()
 
                 # Apply per-subscriber filters.
                 if normalized_target_id and normalized_target_id not in event.matched_target_ids:

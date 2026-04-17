@@ -37,6 +37,11 @@ interface CollectionTargetStatus {
   observed_at: string;
   last_event_at?: string | null;
   last_error?: string | null;
+  permanent_failure?: boolean;
+  failure_reason?: string | null;
+  failure_rt_cd?: string | null;
+  failure_msg?: string | null;
+  failure_attempts?: number | null;
 }
 
 interface RuntimeStatus {
@@ -58,6 +63,8 @@ interface Snapshot {
   collector_offline?: boolean;
   /** Raw container status string reported by the Docker socket. */
   container_status?: string;
+  /** KSXT realtime session state (IDLE/CONNECTING/HEALTHY/DEGRADED/CLOSED). */
+  session_state?: string | null;
 }
 
 interface TargetMutationResponse {
@@ -437,6 +444,20 @@ function TargetsView({
                 <tbody>
                   {targets.map((t) => {
                     const st = statusMap[t.target_id];
+                    const permanent = st?.permanent_failure;
+                    const failureSummary = permanent
+                      ? `${st?.failure_reason ?? 'permanent_failure'}${st?.failure_rt_cd ? ` (${st.failure_rt_cd})` : ''}${st?.failure_attempts != null ? ` · ${st.failure_attempts}회` : ''}`
+                      : '';
+                    const failureTooltip = permanent
+                      ? [
+                          st?.failure_reason && `reason: ${st.failure_reason}`,
+                          st?.failure_rt_cd && `rt_cd: ${st.failure_rt_cd}`,
+                          st?.failure_msg && `msg: ${st.failure_msg}`,
+                          st?.failure_attempts != null && `attempts: ${st.failure_attempts}`,
+                        ]
+                          .filter(Boolean)
+                          .join('\n')
+                      : undefined;
                     return (
                       <tr key={t.target_id} className={draft.targetId === t.target_id ? 'row-selected' : ''}>
                         <td>
@@ -457,7 +478,14 @@ function TargetsView({
                           ))}
                         </td>
                         <td>
-                          <Badge label={st?.state ?? 'unknown'} tone={stateTone(st?.state)} />
+                          {permanent ? (
+                            <div title={failureTooltip} className="perm-failure-cell">
+                              <Badge label="영구 실패" tone="danger" />
+                              <div className="sub mono small">{failureSummary}</div>
+                            </div>
+                          ) : (
+                            <Badge label={st?.state ?? 'unknown'} tone={stateTone(st?.state)} />
+                          )}
                         </td>
                         <td className="mono">{fmt(st?.last_event_at)}</td>
                         <td>
@@ -777,19 +805,42 @@ function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRef
                 </tr>
               </thead>
               <tbody>
-                {targetStatuses.map((s) => (
-                  <tr key={s.target_id}>
-                    <td>
-                      <strong>{labelByTargetId[s.target_id] ?? s.target_id}</strong>
-                    </td>
-                    <td>
-                      <Badge label={s.state} tone={stateTone(s.state)} />
-                    </td>
-                    <td className="mono">{fmt(s.last_event_at)}</td>
-                    <td className="error-cell">{s.last_error ?? '—'}</td>
-                    <td className="mono">{fmt(s.observed_at)}</td>
-                  </tr>
-                ))}
+                {targetStatuses.map((s) => {
+                  const permanent = s.permanent_failure;
+                  const summary = permanent
+                    ? `${s.failure_reason ?? 'permanent_failure'}${s.failure_rt_cd ? ` (${s.failure_rt_cd})` : ''}${s.failure_attempts != null ? ` · ${s.failure_attempts}회` : ''}`
+                    : '';
+                  const tooltip = permanent
+                    ? [
+                        s.failure_reason && `reason: ${s.failure_reason}`,
+                        s.failure_rt_cd && `rt_cd: ${s.failure_rt_cd}`,
+                        s.failure_msg && `msg: ${s.failure_msg}`,
+                        s.failure_attempts != null && `attempts: ${s.failure_attempts}`,
+                      ]
+                        .filter(Boolean)
+                        .join('\n')
+                    : undefined;
+                  return (
+                    <tr key={s.target_id}>
+                      <td>
+                        <strong>{labelByTargetId[s.target_id] ?? s.target_id}</strong>
+                      </td>
+                      <td>
+                        {permanent ? (
+                          <div title={tooltip} className="perm-failure-cell">
+                            <Badge label="영구 실패" tone="danger" />
+                            <div className="sub mono small">{summary}</div>
+                          </div>
+                        ) : (
+                          <Badge label={s.state} tone={stateTone(s.state)} />
+                        )}
+                      </td>
+                      <td className="mono">{fmt(s.last_event_at)}</td>
+                      <td className="error-cell">{s.last_error ?? '—'}</td>
+                      <td className="mono">{fmt(s.observed_at)}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1086,6 +1137,8 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState('');
   const [snapshotBusy, setSnapshotBusy] = useState(true);
+  const [sessionRecoveredFlash, setSessionRecoveredFlash] = useState(false);
+  const recoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshSnapshot = useCallback(async () => {
     setSnapshotBusy(true);
@@ -1108,9 +1161,34 @@ export default function App() {
     void refreshSnapshot();
   }, [refreshSnapshot]);
 
+  // Subscribe to the admin meta-event SSE channel (session_recovered,
+  // session_state_changed) so the top bar can flash a banner without
+  // polluting the market-data event table.  We reuse the existing
+  // /api/admin/events/stream endpoint because the collector emits meta
+  // events on the same stream with distinct SSE event names.
+  useEffect(() => {
+    const es = new EventSource('/api/admin/events/stream?limit=1');
+    es.addEventListener('session_recovered', () => {
+      setSessionRecoveredFlash(true);
+      if (recoveryTimer.current) clearTimeout(recoveryTimer.current);
+      recoveryTimer.current = setTimeout(() => setSessionRecoveredFlash(false), 3000);
+      // Refresh snapshot so permanent-failure/error state clears are
+      // visible immediately rather than on the next poll.
+      void refreshSnapshot();
+    });
+    es.addEventListener('session_state_changed', () => {
+      void refreshSnapshot();
+    });
+    return () => {
+      es.close();
+      if (recoveryTimer.current) clearTimeout(recoveryTimer.current);
+    };
+  }, [refreshSnapshot]);
+
   const targets = snapshot?.collection_targets ?? [];
   const runtime = snapshot?.runtime_status ?? [];
   const anyError = runtime.some((r) => stateTone(r.state) === 'danger');
+  const sessionDegraded = (snapshot?.session_state ?? '').toUpperCase() === 'DEGRADED';
 
   return (
     <div className="shell">
@@ -1155,6 +1233,16 @@ export default function App() {
       {!snapshotError && snapshot?.collector_offline && (
         <div className="global-banner degraded">
           수집기 컨테이너가 오프라인 상태입니다 (container: {snapshot.container_status ?? 'offline'}) — Runtime 탭에서 시작할 수 있습니다.
+        </div>
+      )}
+      {sessionDegraded && (
+        <div className="global-banner session-degraded">
+          KSXT 실시간 세션이 DEGRADED 상태입니다 — 재연결 중. 구독 이벤트가 일시적으로 중단될 수 있습니다.
+        </div>
+      )}
+      {sessionRecoveredFlash && (
+        <div className="global-banner session-recovered">
+          KSXT 실시간 세션 복구 완료 — 재구독이 정상 상태로 돌아왔습니다.
         </div>
       )}
 
