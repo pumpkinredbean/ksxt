@@ -1,9 +1,9 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { NavLink, Navigate, Route, Routes } from 'react-router-dom';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type MarketScope = 'krx' | 'nxt' | 'total';
-type TopView = 'targets' | 'runtime' | 'events';
 
 interface InstrumentRef {
   symbol: string;
@@ -48,12 +48,16 @@ interface RuntimeStatus {
 }
 
 interface Snapshot {
-  captured_at: string;
+  captured_at: string | null;
   source_service: string;
   event_type_catalog: EventCatalogEntry[];
   collection_targets: CollectionTarget[];
   runtime_status: RuntimeStatus[];
   collection_target_status: CollectionTargetStatus[];
+  /** True when the collector container is intentionally offline. */
+  collector_offline?: boolean;
+  /** Raw container status string reported by the Docker socket. */
+  container_status?: string;
 }
 
 interface TargetMutationResponse {
@@ -71,14 +75,6 @@ interface RecentRuntimeEvent {
   published_at: string;
   matched_target_ids: string[];
   payload?: Record<string, unknown>;
-}
-
-interface RecentEventsResponse {
-  captured_at: string;
-  filters: Record<string, unknown>;
-  available_event_names: string[];
-  recent_events: RecentRuntimeEvent[];
-  buffer_size: number;
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
@@ -602,10 +598,70 @@ function TargetsView({
 
 // ─── Runtime View ─────────────────────────────────────────────────────────────
 
-function RuntimeView({ snapshot }: { snapshot: Snapshot | null }) {
+interface CollectorContainerStatus {
+  status: string;
+  container_id: string | null;
+  name: string | null;
+  error?: string;
+}
+
+function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRefresh?: () => Promise<void> }) {
   const runtime = snapshot?.runtime_status ?? [];
   const targetStatuses = snapshot?.collection_target_status ?? [];
   const targets = snapshot?.collection_targets ?? [];
+
+  const [containerStatus, setContainerStatus] = useState<CollectorContainerStatus | null>(null);
+  const [containerBusy, setContainerBusy] = useState(false);
+  const [containerMsg, setContainerMsg] = useState('');
+  const [containerError, setContainerError] = useState(false);
+
+  const fetchContainerStatus = useCallback(async () => {
+    try {
+      const r = await requestJson<CollectorContainerStatus>('/api/admin/collector/status');
+      setContainerStatus(r);
+    } catch {
+      setContainerStatus({ status: 'error', container_id: null, name: null });
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchContainerStatus();
+  }, [fetchContainerStatus]);
+
+  async function doContainerAction(action: 'start' | 'stop') {
+    setContainerBusy(true);
+    setContainerMsg('');
+    setContainerError(false);
+    try {
+      const r = await requestJson<{ ok: boolean; status?: string; error?: string }>(
+        `/api/admin/collector/${action}`,
+        { method: 'POST' },
+      );
+      if (r.ok) {
+        setContainerMsg(action === 'start' ? '컨테이너 시작됨' : '컨테이너 정지됨');
+        await fetchContainerStatus();
+        // Refresh root snapshot so the app reflects the new collector state.
+        if (onRefresh) await onRefresh();
+      } else {
+        setContainerMsg(r.error ?? `${action} 실패`);
+        setContainerError(true);
+      }
+    } catch (err) {
+      setContainerMsg(err instanceof Error ? err.message : `${action} 실패`);
+      setContainerError(true);
+    } finally {
+      setContainerBusy(false);
+    }
+  }
+
+  const isRunning = containerStatus?.status === 'running';
+  const containerTone = containerStatus
+    ? containerStatus.status === 'running'
+      ? 'good'
+      : containerStatus.status === 'exited' || containerStatus.status === 'not_found'
+        ? 'muted'
+        : 'danger'
+    : 'muted';
 
   // Build symbol+scope label from targets for better UX
   const labelByTargetId = Object.fromEntries(
@@ -614,6 +670,55 @@ function RuntimeView({ snapshot }: { snapshot: Snapshot | null }) {
 
   return (
     <div className="col-stack">
+      {/* Collector service lifecycle control */}
+      <section className="panel">
+        <div className="panel-head">
+          <span className="eyebrow">Collector Service</span>
+          {containerStatus && (
+            <Badge label={containerStatus.status} tone={containerTone} />
+          )}
+        </div>
+        <div className="service-control-row">
+          <div className="service-meta">
+            {containerStatus?.name && (
+              <span className="meta-key mono">{containerStatus.name}</span>
+            )}
+            {containerStatus?.container_id && (
+              <span className="meta-key mono">#{containerStatus.container_id}</span>
+            )}
+            {containerStatus?.error && (
+              <span className="hint error-hint">{containerStatus.error}</span>
+            )}
+          </div>
+          <div className="row-actions">
+            <button
+              type="button"
+              className="sm-btn"
+              onClick={() => void fetchContainerStatus()}
+              disabled={containerBusy}
+            >
+              새로고침
+            </button>
+            <button
+              type="button"
+              className="sm-btn"
+              onClick={() => void doContainerAction('start')}
+              disabled={containerBusy || isRunning}
+            >
+              시작
+            </button>
+            <ConfirmButton
+              label="정지"
+              confirmLabel="정지 확인"
+              onConfirm={() => void doContainerAction('stop')}
+              disabled={containerBusy || !isRunning}
+              className="sm-btn danger-sm"
+            />
+          </div>
+        </div>
+        {containerMsg && <Banner msg={containerMsg} error={containerError} />}
+      </section>
+
       <section className="panel">
         <div className="panel-head">
           <span className="eyebrow">Service Health</span>
@@ -707,58 +812,160 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
   const [filterScope, setFilterScope] = useState('');
   const [filterName, setFilterName] = useState('');
   const [limit, setLimit] = useState(50);
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState('');
-  const [error, setError] = useState(false);
+  const [streamStatus, setStreamStatus] = useState<'connecting' | 'live' | 'error'>('connecting');
+  const [streamError, setStreamError] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const buildUrl = useCallback(() => {
-    const params = new URLSearchParams();
-    if (filterSymbol.trim()) params.set('symbol', filterSymbol.trim());
-    if (filterScope) params.set('scope', filterScope);
-    if (filterName) params.set('event_name', filterName);
-    params.set('limit', String(limit));
-    return `/api/admin/events?${params.toString()}`;
-  }, [filterSymbol, filterScope, filterName, limit]);
+  // Pending filter values — applied on "적용" click to avoid reconnecting on each keystroke
+  const [pendingSymbol, setPendingSymbol] = useState('');
+  const [pendingScope, setPendingScope] = useState('');
+  const [pendingName, setPendingName] = useState('');
+  const [pendingLimit, setPendingLimit] = useState(50);
 
-  async function fetchEvents() {
-    setBusy(true);
-    setMsg('');
-    setError(false);
-    try {
-      const r = await requestJson<RecentEventsResponse>(buildUrl());
-      setEvents(r.recent_events ?? []);
-      setBufferSize(r.buffer_size ?? 0);
-      setCapturedAt(r.captured_at ?? '');
-      setAvailableNames(r.available_event_names ?? []);
-      setMsg(`${r.recent_events?.length ?? 0}건 · 버퍼 ${r.buffer_size ?? 0}개`);
-    } catch (err) {
-      setEvents([]);
-      setMsg(err instanceof Error ? err.message : '이벤트 조회 실패');
-      setError(true);
-    } finally {
-      setBusy(false);
-    }
-  }
+  const esRef = useRef<EventSource | null>(null);
 
+  const buildStreamUrl = useCallback(
+    (sym: string, scope: string, name: string, lim: number) => {
+      const params = new URLSearchParams();
+      if (sym.trim()) params.set('symbol', sym.trim());
+      if (scope) params.set('scope', scope);
+      if (name) params.set('event_name', name);
+      params.set('limit', String(lim));
+      return `/api/admin/events/stream?${params.toString()}`;
+    },
+    [],
+  );
+
+  const openStream = useCallback(
+    (sym: string, scope: string, name: string, lim: number) => {
+      // Close any existing stream first
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+
+      setStreamStatus('connecting');
+      setStreamError('');
+
+      const url = buildStreamUrl(sym, scope, name, lim);
+      const es = new EventSource(url);
+      esRef.current = es;
+
+      es.addEventListener('connected', () => {
+        // Server sends 'connected' immediately on stream open — go live right away.
+        setStreamStatus('live');
+        setStreamError('');
+      });
+
+      es.addEventListener('events', (e: MessageEvent) => {
+        try {
+          const batch = JSON.parse(e.data) as {
+            new_events: RecentRuntimeEvent[];
+            available_event_names: string[];
+            buffer_size: number;
+            captured_at: string;
+          };
+          setStreamStatus('live');
+          if (batch.new_events && batch.new_events.length > 0) {
+            setEvents((prev) => {
+              // Prepend new events; keep total at most lim entries
+              const combined = [...batch.new_events, ...prev];
+              return combined.slice(0, lim);
+            });
+          }
+          if (batch.available_event_names) setAvailableNames(batch.available_event_names);
+          if (batch.buffer_size !== undefined) setBufferSize(batch.buffer_size);
+          if (batch.captured_at) setCapturedAt(batch.captured_at);
+        } catch {
+          // ignore parse errors
+        }
+      });
+
+      // 'upstream_error' is a server-side named event signalling that the
+      // collector is temporarily unreachable.  It is intentionally distinct
+      // from the browser-native EventSource error (transport failure).
+      es.addEventListener('upstream_error', (e: Event) => {
+        const msgEvt = e as MessageEvent;
+        let errMsg = '수집기 연결 오류';
+        try {
+          const parsed = JSON.parse(msgEvt.data) as { error?: string };
+          if (parsed.error) errMsg = parsed.error;
+        } catch {
+          // ignore
+        }
+        // Keep streamStatus as 'live' — the SSE transport is still up.
+        // Show the upstream error inline without marking the whole stream broken.
+        setStreamError(errMsg);
+      });
+
+      es.onopen = () => {
+        // Transport-level open: mark as connected even before the first data.
+        setStreamStatus('live');
+        setStreamError('');
+      };
+
+      es.onerror = () => {
+        // EventSource will auto-reconnect; only flag as error when truly closed.
+        if (es.readyState === EventSource.CLOSED) {
+          setStreamStatus('error');
+          setStreamError('스트림 연결이 끊어졌습니다. 재연결 중…');
+        } else {
+          // readyState is CONNECTING — browser is auto-reconnecting, stay 'connecting'
+          setStreamStatus('connecting');
+        }
+      };
+    },
+    [buildStreamUrl],
+  );
+
+  // Open stream on mount with default filters
   useEffect(() => {
-    void fetchEvents();
+    openStream(filterSymbol, filterScope, filterName, limit);
+    return () => {
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Apply pending filters and reconnect stream
+  function applyFilters() {
+    setFilterSymbol(pendingSymbol);
+    setFilterScope(pendingScope);
+    setFilterName(pendingName);
+    setLimit(pendingLimit);
+    setEvents([]);
+    openStream(pendingSymbol, pendingScope, pendingName, pendingLimit);
+  }
 
   // Build symbol options from known targets
   const symbolOptions = [...new Set(targets.map((t) => t.instrument.symbol))];
+
+  const statusLabel =
+    streamStatus === 'connecting'
+      ? '연결 중…'
+      : streamStatus === 'live'
+        ? '실시간'
+        : '오류';
+  const statusClass =
+    streamStatus === 'connecting'
+      ? 'hint'
+      : streamStatus === 'live'
+        ? 'hint live-hint'
+        : 'hint error-hint';
 
   return (
     <div className="col-stack">
       <section className="panel">
         <div className="panel-head">
           <span className="eyebrow">Recent Runtime Events</span>
-          {capturedAt && <span className="hint-inline">캡처: {fmt(capturedAt)}</span>}
+          <span className={statusClass}>{statusLabel}{capturedAt ? ` · 캡처: ${fmt(capturedAt)}` : ''}</span>
         </div>
 
-        {/* Filters */}
+        {/* Filters — changes are pending until "적용" is clicked */}
         <div className="filter-bar">
-          <select value={filterSymbol} onChange={(e) => setFilterSymbol(e.target.value)}>
+          <select value={pendingSymbol} onChange={(e) => setPendingSymbol(e.target.value)}>
             <option value="">모든 종목</option>
             {symbolOptions.map((s) => (
               <option key={s} value={s}>
@@ -766,7 +973,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
               </option>
             ))}
           </select>
-          <select value={filterScope} onChange={(e) => setFilterScope(e.target.value)}>
+          <select value={pendingScope} onChange={(e) => setPendingScope(e.target.value)}>
             <option value="">모든 시장</option>
             {MARKET_SCOPES.map((s) => (
               <option key={s} value={s}>
@@ -774,7 +981,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
               </option>
             ))}
           </select>
-          <select value={filterName} onChange={(e) => setFilterName(e.target.value)}>
+          <select value={pendingName} onChange={(e) => setPendingName(e.target.value)}>
             <option value="">모든 이벤트</option>
             {availableNames.map((n) => (
               <option key={n} value={n}>
@@ -783,8 +990,8 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
             ))}
           </select>
           <select
-            value={limit}
-            onChange={(e) => setLimit(Number(e.target.value))}
+            value={pendingLimit}
+            onChange={(e) => setPendingLimit(Number(e.target.value))}
             className="narrow-select"
           >
             {[25, 50, 100, 200].map((n) => (
@@ -793,12 +1000,17 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
               </option>
             ))}
           </select>
-          <button type="button" onClick={() => void fetchEvents()} disabled={busy}>
-            {busy ? '조회 중…' : '조회'}
+          <button type="button" onClick={applyFilters}>
+            적용
           </button>
         </div>
 
-        {msg && <div className={error ? 'hint error-hint' : 'hint'}>{msg}</div>}
+        {streamStatus === 'error' && streamError && (
+          <div className="hint error-hint">{streamError}</div>
+        )}
+        {streamStatus !== 'error' && streamError && (
+          <div className="hint error-hint">수집기 오류: {streamError}</div>
+        )}
 
         {events.length === 0 ? (
           <Empty msg="최근 이벤트 없음 — 수집 대상을 활성화하면 이벤트가 쌓입니다." />
@@ -871,7 +1083,6 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [view, setView] = useState<TopView>('targets');
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState('');
   const [snapshotBusy, setSnapshotBusy] = useState(true);
@@ -882,7 +1093,11 @@ export default function App() {
     try {
       const next = await requestJson<Snapshot>('/api/admin/snapshot');
       setSnapshot(next);
+      // collector_offline is a graceful degraded state, not a global error.
+      // Leave snapshotError empty so no top-banner is shown.
     } catch (err) {
+      // Only surface as a global error if the fetch itself fails (network
+      // error, non-200 that wasn't converted to collector_offline, etc.)
       setSnapshotError(err instanceof Error ? err.message : '스냅샷 로드 실패');
     } finally {
       setSnapshotBusy(false);
@@ -905,20 +1120,6 @@ export default function App() {
           <span className="brand-label">KIS Admin</span>
           <span className="brand-sub">Collector Control Plane</span>
         </div>
-        <nav className="topbar-nav">
-          {(['targets', 'runtime', 'events'] as TopView[]).map((v) => (
-            <button
-              key={v}
-              type="button"
-              className={`nav-btn${view === v ? ' active' : ''}`}
-              onClick={() => setView(v)}
-            >
-              {v === 'targets' && 'Targets'}
-              {v === 'runtime' && 'Runtime'}
-              {v === 'events' && 'Events'}
-            </button>
-          ))}
-        </nav>
         <div className="topbar-meta">
           <span className="meta-stat">
             <span className="meta-key">Targets</span>
@@ -951,19 +1152,45 @@ export default function App() {
       {snapshotError && (
         <div className="global-banner error">{snapshotError}</div>
       )}
+      {!snapshotError && snapshot?.collector_offline && (
+        <div className="global-banner degraded">
+          수집기 컨테이너가 오프라인 상태입니다 (container: {snapshot.container_status ?? 'offline'}) — Runtime 탭에서 시작할 수 있습니다.
+        </div>
+      )}
 
-      {/* Main content */}
-      <main className="main">
-        {view === 'targets' && (
-          <TargetsView
-            snapshot={snapshot}
-            snapshotBusy={snapshotBusy}
-            onRefresh={refreshSnapshot}
-          />
-        )}
-        {view === 'runtime' && <RuntimeView snapshot={snapshot} />}
-        {view === 'events' && <EventsView snapshot={snapshot} />}
-      </main>
+      {/* Body: sidebar + main content */}
+      <div className="body-layout">
+        <nav className="sidebar">
+          <NavLink to="/targets" className={({ isActive }) => `nav-btn${isActive ? ' active' : ''}`}>
+            Targets
+          </NavLink>
+          <NavLink to="/runtime" className={({ isActive }) => `nav-btn${isActive ? ' active' : ''}`}>
+            Runtime
+          </NavLink>
+          <NavLink to="/events" className={({ isActive }) => `nav-btn${isActive ? ' active' : ''}`}>
+            Events
+          </NavLink>
+        </nav>
+
+        <main className="main">
+          <Routes>
+            <Route index element={<Navigate to="/targets" replace />} />
+            <Route
+              path="targets"
+              element={
+                <TargetsView
+                  snapshot={snapshot}
+                  snapshotBusy={snapshotBusy}
+                  onRefresh={refreshSnapshot}
+                />
+              }
+            />
+            <Route path="runtime" element={<RuntimeView snapshot={snapshot} onRefresh={refreshSnapshot} />} />
+            <Route path="events" element={<EventsView snapshot={snapshot} />} />
+            <Route path="*" element={<Navigate to="/targets" replace />} />
+          </Routes>
+        </main>
+      </div>
     </div>
   );
 }

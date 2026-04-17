@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -67,6 +68,7 @@ class CollectorControlPlaneService:
         self._last_service_error: str | None = None
         self._last_event_at_by_target: dict[str, datetime] = {}
         self._recent_events: deque[RecentRuntimeEvent] = deque(maxlen=250)
+        self._event_subscribers: list[asyncio.Queue[RecentRuntimeEvent]] = []
 
     async def mark_running(self) -> None:
         async with self._lock:
@@ -259,18 +261,40 @@ class CollectorControlPlaneService:
                 self._target_errors[target_id] = None
             if matched_target_ids:
                 self._last_service_error = None
-            self._recent_events.appendleft(
-                RecentRuntimeEvent(
-                    event_id=uuid.uuid4().hex,
-                    topic_name=topic_name,
-                    event_name=normalized_event_name,
-                    symbol=normalized_symbol,
-                    market_scope=normalized_market_scope,
-                    published_at=published_at,
-                    matched_target_ids=matched_target_ids,
-                    payload=payload,
-                )
+            event = RecentRuntimeEvent(
+                event_id=uuid.uuid4().hex,
+                topic_name=topic_name,
+                event_name=normalized_event_name,
+                symbol=normalized_symbol,
+                market_scope=normalized_market_scope,
+                published_at=published_at,
+                matched_target_ids=matched_target_ids,
+                payload=payload,
             )
+            self._recent_events.appendleft(event)
+            subscribers = list(self._event_subscribers)
+
+        # Notify subscribers outside the lock so no subscriber can block record_runtime_event.
+        for queue in subscribers:
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(event)
+
+    @asynccontextmanager
+    async def subscribe_events(self) -> AsyncIterator[asyncio.Queue[RecentRuntimeEvent]]:
+        """Async context manager yielding a queue that receives every new RecentRuntimeEvent.
+
+        Events are delivered immediately when record_runtime_event() is called.
+        The queue is bounded (maxsize=500); events are silently dropped for slow consumers.
+        """
+        queue: asyncio.Queue[RecentRuntimeEvent] = asyncio.Queue(maxsize=500)
+        async with self._lock:
+            self._event_subscribers.append(queue)
+        try:
+            yield queue
+        finally:
+            async with self._lock:
+                with contextlib.suppress(ValueError):
+                    self._event_subscribers.remove(queue)
 
     async def record_publication_failure(self, *, symbol: str, market_scope: str, error: str) -> None:
         normalized_symbol = symbol.strip()
@@ -285,6 +309,31 @@ class CollectorControlPlaneService:
             for target_id in matched_target_ids:
                 self._target_errors[target_id] = error
             self._last_service_error = error
+
+    async def clear_publication_errors(self, *, symbol: str, market_scope: str) -> None:
+        """Clear per-target error state for a symbol/market_scope pair.
+
+        Called when a new upstream session is established so stale errors set by a
+        previous session failure are removed before fresh events start arriving.
+        Only clears errors for targets that currently have one; targets without an
+        error are left untouched.
+        """
+        normalized_symbol = symbol.strip()
+        normalized_market_scope = self._normalize_market_scope(market_scope)
+
+        async with self._lock:
+            matched_target_ids = tuple(
+                target.target_id
+                for target in self._targets.values()
+                if target.instrument.symbol == normalized_symbol and target.market_scope == normalized_market_scope
+            )
+            cleared_any = False
+            for target_id in matched_target_ids:
+                if self._target_errors.get(target_id):
+                    self._target_errors[target_id] = None
+                    cleared_any = True
+            if cleared_any:
+                self._last_service_error = None
 
     async def recent_events(
         self,
@@ -377,6 +426,11 @@ class CollectorControlPlaneService:
             last_error=last_error,
         )
 
+    @staticmethod
+    def _is_krx_symbol(query: str) -> bool:
+        """Return True if the query looks like a bare 6-digit KRX stock code."""
+        return len(query) == 6 and query.isdigit()
+
     def _search_catalog(self, query: str, market_scope: str, *, target_symbols: tuple[str, ...], limit: int) -> tuple[InstrumentSearchResult, ...]:
         normalized_query = query.strip().lower()
         seen_symbols: set[str] = set()
@@ -386,6 +440,11 @@ class CollectorControlPlaneService:
         for target_symbol in target_symbols:
             if target_symbol not in {symbol for symbol, _name in catalog_entries}:
                 catalog_entries.append((target_symbol, f"종목 {target_symbol}"))
+
+        # If the query is itself a 6-digit symbol not already in the catalog,
+        # inject it as a direct match so arbitrary KRX codes are always selectable.
+        if self._is_krx_symbol(query) and query not in {s for s, _ in catalog_entries}:
+            catalog_entries.insert(0, (query, f"종목 {query}"))
 
         results: list[InstrumentSearchResult] = []
         for symbol, display_name in catalog_entries:

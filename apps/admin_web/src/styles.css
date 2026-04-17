@@ -13,16 +13,97 @@
   padding: 0;
 }
 
+/* Viewport lock: prevent global page scroll */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* #root must fill the full viewport so .shell grid rows work correctly */
+#root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
   background: #f1f4f9;
   color: #0f1725;
 }
 
 /* ── Shell ────────────────────────────────────────────────────────── */
+/* Constrain to viewport height; rows: topbar | optional banner | body */
 .shell {
   display: grid;
   grid-template-rows: auto auto 1fr;
-  min-height: 100vh;
+  /* Fill the #root flex container instead of using 100vh independently */
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Body layout: sidebar + main ─────────────────────────────────── */
+/* height:100% fills the 1fr grid cell assigned by .shell.            */
+/* min-height:0 lets it compress below intrinsic content height.      */
+/* overflow:hidden clips children; each pane owns its own scroll.     */
+.body-layout {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  /* Always place in row 3 (the 1fr row) of .shell regardless of whether the
+     optional global-banner is rendered.  Without this, CSS auto-placement
+     puts .body-layout in row 2 (auto) when the banner is absent, leaving the
+     1fr row empty and sizing .body-layout by content instead of viewport. */
+  grid-row: 3;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────── */
+/* align-self:stretch + overflow-y:auto keeps the sidebar locked to   */
+/* the grid cell height and scrolls internally when items overflow.   */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 10px;
+  background: #0f1725;
+  border-right: 1px solid #1e2d45;
+  /* Force the sidebar to fill the grid cell height, never expand beyond it */
+  align-self: stretch;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar .nav-btn {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.sidebar .nav-btn:hover {
+  background: #1e2d45;
+  color: #e2e8f0;
+}
+
+.sidebar .nav-btn.active {
+  background: #1e3a5f;
+  border-color: #2d5a9e;
+  color: #93c5fd;
+  font-weight: 600;
 }
 
 /* ── Top Bar ──────────────────────────────────────────────────────── */
@@ -55,38 +136,6 @@ body {
   font-size: 11px;
   color: #64748b;
   letter-spacing: 0.04em;
-}
-
-.topbar-nav {
-  display: flex;
-  gap: 2px;
-}
-
-.nav-btn {
-  display: inline-flex;
-  align-items: center;
-  height: 32px;
-  padding: 0 14px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: #94a3b8;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s;
-}
-
-.nav-btn:hover {
-  background: #1e2d45;
-  color: #e2e8f0;
-}
-
-.nav-btn.active {
-  background: #1e3a5f;
-  border-color: #2d5a9e;
-  color: #93c5fd;
-  font-weight: 600;
 }
 
 .topbar-meta {
@@ -131,9 +180,21 @@ body {
   color: #b91c1c;
 }
 
+.global-banner.degraded {
+  background: #fffbeb;
+  color: #92400e;
+  border-bottom: 1px solid #fde68a;
+}
+
 /* ── Main ─────────────────────────────────────────────────────────── */
+/* Main content area scrolls internally; fills the remaining 1fr height.  */
+/* align-self:stretch pins it to the grid cell so it never pushes taller. */
 .main {
   padding: 16px 20px 28px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+  align-self: stretch;
 }
 
 /* ── Panel ────────────────────────────────────────────────────────── */
@@ -580,6 +641,11 @@ tr.payload-row td {
   color: #b91c1c;
 }
 
+.live-hint {
+  color: #166534;
+  font-weight: 600;
+}
+
 .error-cell {
   color: #b91c1c;
   font-size: 12px;
@@ -623,7 +689,42 @@ tr.payload-row td {
     gap: 10px;
   }
 
+  .body-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    border-right: none;
+    border-bottom: 1px solid #1e2d45;
+    overflow-y: visible;
+    overflow-x: auto;
+  }
+
+  .sidebar .nav-btn {
+    width: auto;
+  }
+
   .field-row {
     grid-template-columns: 1fr;
   }
+}
+
+/* ── Service control row ─────────────────────────────────────────── */
+.service-control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0 4px;
+  flex-wrap: wrap;
+}
+
+.service-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
