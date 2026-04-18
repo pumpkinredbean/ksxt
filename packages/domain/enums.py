@@ -38,15 +38,37 @@ class TradeSide(StrEnum):
 
 
 class InstrumentType(StrEnum):
-    """Minimal instrument classification scaffold."""
+    """Instrument type classification supporting multiprovider semantics.
+
+    Includes both legacy labels (equity/etf/fx_pair/crypto_pair) and
+    multiprovider-ready semantics (spot/future/perpetual/option) so crypto
+    venues can distinguish spot vs USDT-perpetual from day 1 while KRX
+    equity defaults keep their existing ``equity`` label.
+    """
 
     EQUITY = "equity"
     ETF = "etf"
+    SPOT = "spot"
     FUTURE = "future"
+    PERPETUAL = "perpetual"
     OPTION = "option"
     FX_PAIR = "fx_pair"
     CRYPTO_PAIR = "crypto_pair"
     INDEX = "index"
+    OTHER = "other"
+
+
+class Provider(StrEnum):
+    """First-class provider/hub axis for multiprovider targets.
+
+    ``KXT`` covers the KSXT-backed KIS integration (KRX equity today).
+    ``CCXT`` and ``CCXT_PRO`` cover the crypto integration boundary and
+    are introduced as a skeleton in step 1 of the multiprovider plan.
+    """
+
+    KXT = "kxt"
+    CCXT = "ccxt"
+    CCXT_PRO = "ccxt_pro"
     OTHER = "other"
 
 

@@ -68,8 +68,10 @@ from pydantic import BaseModel
 
 from apps.collector.publisher import CollectorPublisher
 from apps.collector.runtime import CollectorRuntime, SUPPORTED_MARKET_SCOPES
+from packages.adapters import build_default_registry
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC
+from packages.domain.enums import Provider
 from packages.infrastructure.kafka import AsyncKafkaJsonBroker
 from packages.shared.config import load_service_settings
 from src.collector_control_plane import CollectorControlPlaneService
@@ -121,6 +123,10 @@ def _resolve_market_scope(*, scope: str | None = None, market: str | None = None
 class CollectorDashboardService:
     def __init__(self, settings: Any):
         self._settings = settings
+        # Build the provider registry so the service surface can report
+        # which providers (KXT/CCXT/CCXT Pro) are known to the hub.  Runtime
+        # branching currently only implements KXT (step 1 scope).
+        self._provider_registry = build_default_registry()
         self._collector_runtime = CollectorRuntime(
             kis_settings,
             on_event=self._handle_runtime_event,
@@ -171,6 +177,9 @@ class CollectorDashboardService:
         market_scope: str,
         owner_id: str | None = None,
         event_types: tuple[str, ...] | list[str] | None = None,
+        provider: str | Provider | None = None,
+        instrument_type: str | None = None,
+        canonical_symbol: str | None = None,
     ) -> dict[str, Any]:
         subscription = self._build_subscription(symbol=symbol, market_scope=market_scope)
         resolved_owner_id = owner_id or uuid.uuid4().hex
@@ -180,6 +189,8 @@ class CollectorDashboardService:
             symbol=subscription.symbol,
             market_scope=subscription.market_scope,
             event_types=event_types or _all_dashboard_event_types(),
+            provider=provider,
+            canonical_symbol=canonical_symbol,
         )
 
         async with self._lock:
@@ -190,6 +201,8 @@ class CollectorDashboardService:
             "symbol": subscription.symbol,
             "market_scope": subscription.market_scope,
             "market": subscription.market_scope,
+            "provider": (provider or Provider.KXT.value) if isinstance(provider, str) else (provider.value if provider else Provider.KXT.value),
+            "canonical_symbol": canonical_symbol,
             "status": "started",
         }
 

@@ -27,6 +27,7 @@ from kxt import (
 )
 
 from packages.contracts import EventType
+from packages.domain.enums import Provider
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ class RuntimeTargetRegistration:
     owner_id: str
     stream_key: DashboardStreamKey
     event_types: tuple[str, ...]
+    provider: Provider = Provider.KXT
+    canonical_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,10 +259,21 @@ class CollectorRuntime:
         symbol: str,
         market_scope: str,
         event_types: tuple[str, ...] | list[str] | None = None,
+        provider: str | Provider | None = None,
+        canonical_symbol: str | None = None,
     ) -> RuntimeTargetRegistration:
         normalized_owner_id = owner_id.strip()
         if not normalized_owner_id:
             raise ValueError("owner_id is required")
+
+        resolved_provider = self._resolve_provider(provider)
+        if resolved_provider != Provider.KXT:
+            # Step 1 scope: non-KXT providers are wired at the boundary but
+            # their runtime adapter is not yet implemented.  Fail loudly so
+            # the collector never silently accepts a target it cannot serve.
+            raise NotImplementedError(
+                f"runtime adapter for provider={resolved_provider.value} is not wired yet"
+            )
 
         stream_key = self._build_stream_key(symbol=symbol, market_scope=market_scope)
         normalized_event_types = self._normalize_event_types(event_types)
@@ -267,6 +281,8 @@ class CollectorRuntime:
             owner_id=normalized_owner_id,
             stream_key=stream_key,
             event_types=normalized_event_types,
+            provider=resolved_provider,
+            canonical_symbol=canonical_symbol,
         )
 
         await self._wait_session_ready(timeout=self._SESSION_READY_TIMEOUT)
@@ -645,6 +661,17 @@ class CollectorRuntime:
         if not normalized_symbol:
             raise ValueError("symbol is required")
         return DashboardStreamKey(symbol=normalized_symbol, market_scope=normalized_market_scope)
+
+    @staticmethod
+    def _resolve_provider(provider: str | Provider | None) -> Provider:
+        if provider is None or provider == "":
+            return Provider.KXT
+        if isinstance(provider, Provider):
+            return provider
+        try:
+            return Provider(str(provider).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"unsupported provider: {provider}") from exc
 
     def _normalize_event_types(self, event_types: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
         if event_types is None:

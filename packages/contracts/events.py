@@ -39,7 +39,10 @@ CanonicalEventEnvelope = CanonicalEvent
 class DashboardEventEnvelope:
     """Broker-neutral envelope for live dashboard fan-out events.
 
-    `market_scope` represents request selection scope (`krx|nxt|total`), not a venue model.
+    ``market_scope`` represents the KRX request selection scope
+    (``krx|nxt|total``); it is empty / ignored for non-KRX providers.
+    ``provider`` and ``canonical_symbol`` are additive multiprovider axes
+    that default to ``None`` to keep existing KXT envelopes shape-stable.
     """
 
     symbol: str
@@ -48,13 +51,16 @@ class DashboardEventEnvelope:
     payload: dict[str, Any]
     published_at: datetime
     schema_version: str = "v1"
+    provider: str | None = None
+    canonical_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DashboardControlEnvelope:
     """Broker-neutral envelope for dashboard publication control.
 
-    `market_scope` represents request selection scope (`krx|nxt|total`), not a venue model.
+    ``market_scope`` represents the KRX request selection scope
+    (``krx|nxt|total``); it is empty / ignored for non-KRX providers.
     """
 
     action: str
@@ -63,3 +69,5 @@ class DashboardControlEnvelope:
     market_scope: str
     requested_at: datetime
     schema_version: str = "v1"
+    provider: str | None = None
+    canonical_symbol: str | None = None

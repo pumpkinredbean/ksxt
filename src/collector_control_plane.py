@@ -16,10 +16,20 @@ logger = logging.getLogger(__name__)
 from packages.contracts.admin import ControlPlaneSnapshot, EventTypeCatalogEntry, RecentRuntimeEvent
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_EVENTS_TOPIC
-from packages.domain.enums import AssetClass, InstrumentType, RuntimeState, Venue
-from packages.domain.models import CollectionTarget, CollectionTargetStatus, InstrumentRef, InstrumentSearchResult, RuntimeStatus, StorageBinding
+from packages.domain.enums import AssetClass, InstrumentType, Provider, RuntimeState, Venue
+from packages.domain.models import (
+    CollectionTarget,
+    CollectionTargetStatus,
+    InstrumentRef,
+    InstrumentSearchResult,
+    RuntimeStatus,
+    StorageBinding,
+    build_canonical_symbol,
+)
 
 
+# KRX-only market selection scope.  Non-KXT providers pass ``""`` (empty)
+# which means "not applicable".
 SUPPORTED_MARKET_SCOPES = {"krx", "nxt", "total"}
 
 
@@ -148,12 +158,22 @@ class CollectorControlPlaneService:
             session_state=session_state,
         )
 
-    async def search_instruments(self, *, query: str, market_scope: str | None = None, limit: int = 10) -> tuple[InstrumentSearchResult, ...]:
+    async def search_instruments(self, *, query: str, market_scope: str | None = None, limit: int = 10, provider: str | Provider | None = None) -> tuple[InstrumentSearchResult, ...]:
         normalized_query = query.strip()
-        resolved_market_scope = self._normalize_market_scope(market_scope or self._default_market_scope)
+        resolved_provider = self._normalize_provider(provider)
+        resolved_market_scope = self._normalize_market_scope(
+            market_scope if market_scope is not None else self._default_market_scope,
+            provider=resolved_provider,
+        )
         async with self._lock:
             target_symbols = tuple(target.instrument.symbol for target in self._targets.values())
-        results = self._search_catalog(normalized_query, resolved_market_scope, target_symbols=target_symbols, limit=max(1, min(limit, 50)))
+        results = self._search_catalog(
+            normalized_query,
+            resolved_market_scope,
+            target_symbols=target_symbols,
+            limit=max(1, min(limit, 50)),
+            provider=resolved_provider,
+        )
         async with self._lock:
             self._last_search_results = results
         return results
@@ -166,12 +186,19 @@ class CollectorControlPlaneService:
         market_scope: str,
         event_types: list[str] | tuple[str, ...],
         enabled: bool,
+        provider: str | Provider | None = None,
+        instrument_type: str | InstrumentType | None = None,
     ) -> dict[str, object]:
         normalized_symbol = symbol.strip()
         if not normalized_symbol:
             raise ValueError("symbol is required")
 
-        resolved_market_scope = self._normalize_market_scope(market_scope)
+        resolved_provider = self._normalize_provider(provider)
+        resolved_instrument_type = self._normalize_instrument_type(
+            instrument_type,
+            provider=resolved_provider,
+        )
+        resolved_market_scope = self._normalize_market_scope(market_scope, provider=resolved_provider)
         normalized_event_types = self._normalize_event_types(event_types)
         requested_target_id = (target_id or "").strip()
 
@@ -179,16 +206,25 @@ class CollectorControlPlaneService:
             existing_target_ids = [
                 existing.target_id
                 for existing in self._targets.values()
-                if existing.instrument.symbol == normalized_symbol and existing.market_scope == resolved_market_scope
+                if existing.instrument.symbol == normalized_symbol
+                and existing.market_scope == resolved_market_scope
+                and (existing.provider or Provider.KXT) == resolved_provider
             ]
 
         resolved_target_id = requested_target_id or (existing_target_ids[0] if existing_target_ids else uuid.uuid4().hex)
+        instrument_ref = self._build_instrument_ref(
+            normalized_symbol,
+            provider=resolved_provider,
+            instrument_type=resolved_instrument_type,
+        )
         target = CollectionTarget(
             target_id=resolved_target_id,
-            instrument=self._build_instrument_ref(normalized_symbol),
+            instrument=instrument_ref,
             market_scope=resolved_market_scope,
             event_types=normalized_event_types,
             enabled=enabled,
+            provider=resolved_provider,
+            canonical_symbol=instrument_ref.canonical_symbol,
         )
 
         duplicate_target_ids = [existing_target_id for existing_target_id in existing_target_ids if existing_target_id != resolved_target_id]
@@ -209,6 +245,18 @@ class CollectorControlPlaneService:
         apply_error: str | None = None
         if enabled:
             try:
+                await self._start_publication(
+                    symbol=normalized_symbol,
+                    market_scope=resolved_market_scope,
+                    owner_id=resolved_target_id,
+                    event_types=normalized_event_types,
+                    provider=resolved_provider.value,
+                    instrument_type=resolved_instrument_type.value if resolved_instrument_type else None,
+                    canonical_symbol=instrument_ref.canonical_symbol,
+                )
+            except TypeError:
+                # Backwards compatibility with start_publication callbacks that
+                # do not yet accept provider-aware kwargs (e.g. older tests).
                 await self._start_publication(
                     symbol=normalized_symbol,
                     market_scope=resolved_market_scope,
@@ -267,10 +315,13 @@ class CollectorControlPlaneService:
         event_name: str,
         payload: dict[str, Any],
         topic_name: str = DASHBOARD_EVENTS_TOPIC,
+        provider: str | Provider | None = None,
+        canonical_symbol: str | None = None,
     ) -> None:
         published_at = datetime.utcnow()
         normalized_symbol = symbol.strip()
-        normalized_market_scope = self._normalize_market_scope(market_scope)
+        resolved_provider = self._normalize_provider(provider)
+        normalized_market_scope = self._normalize_market_scope(market_scope, provider=resolved_provider)
         normalized_event_name = self._normalize_event_name(event_name)
 
         async with self._lock:
@@ -296,6 +347,8 @@ class CollectorControlPlaneService:
                 published_at=published_at,
                 matched_target_ids=matched_target_ids,
                 payload=payload,
+                provider=resolved_provider.value,
+                canonical_symbol=canonical_symbol,
             )
             self._recent_events.appendleft(event)
             subscribers = list(self._event_subscribers)
@@ -555,7 +608,15 @@ class CollectorControlPlaneService:
         """Return True if the query looks like a bare 6-digit KRX stock code."""
         return len(query) == 6 and query.isdigit()
 
-    def _search_catalog(self, query: str, market_scope: str, *, target_symbols: tuple[str, ...], limit: int) -> tuple[InstrumentSearchResult, ...]:
+    def _search_catalog(
+        self,
+        query: str,
+        market_scope: str,
+        *,
+        target_symbols: tuple[str, ...],
+        limit: int,
+        provider: Provider = Provider.KXT,
+    ) -> tuple[InstrumentSearchResult, ...]:
         normalized_query = query.strip().lower()
         seen_symbols: set[str] = set()
         catalog_entries = list(BOOTSTRAP_INSTRUMENTS)
@@ -574,30 +635,72 @@ class CollectorControlPlaneService:
         for symbol, display_name in catalog_entries:
             if normalized_query and normalized_query not in symbol.lower() and normalized_query not in display_name.lower():
                 continue
-            results.append(self._build_search_result(symbol=symbol, display_name=display_name, market_scope=market_scope))
+            results.append(
+                self._build_search_result(
+                    symbol=symbol,
+                    display_name=display_name,
+                    market_scope=market_scope,
+                    provider=provider,
+                )
+            )
             seen_symbols.add(symbol)
             if len(results) >= limit:
                 return tuple(results)
 
         return tuple(results)
 
-    def _build_search_result(self, *, symbol: str, display_name: str, market_scope: str) -> InstrumentSearchResult:
+    def _build_search_result(
+        self,
+        *,
+        symbol: str,
+        display_name: str,
+        market_scope: str,
+        provider: Provider = Provider.KXT,
+    ) -> InstrumentSearchResult:
+        instrument_ref = self._build_instrument_ref(symbol, provider=provider)
         return InstrumentSearchResult(
-            instrument=self._build_instrument_ref(symbol),
+            instrument=instrument_ref,
             display_name=display_name,
             market_scope=market_scope,
             provider_instrument_id=symbol,
-            venue_code="KRX",
+            venue_code="KRX" if provider == Provider.KXT else None,
             is_active=True,
+            provider=provider,
+            canonical_symbol=instrument_ref.canonical_symbol,
         )
 
-    def _build_instrument_ref(self, symbol: str) -> InstrumentRef:
+    def _build_instrument_ref(
+        self,
+        symbol: str,
+        *,
+        provider: Provider = Provider.KXT,
+        instrument_type: InstrumentType | None = None,
+    ) -> InstrumentRef:
+        # KXT today means KRX equity; other providers default to crypto spot
+        # semantics unless the caller overrides instrument_type.
+        if provider == Provider.KXT:
+            venue = Venue.KRX
+            asset_class = AssetClass.EQUITY
+            resolved_instrument_type = instrument_type or InstrumentType.EQUITY
+        else:
+            venue = Venue.BINANCE
+            asset_class = AssetClass.CRYPTO
+            resolved_instrument_type = instrument_type or InstrumentType.SPOT
+
+        canonical = build_canonical_symbol(
+            provider=provider,
+            venue=venue,
+            instrument_type=resolved_instrument_type,
+            symbol=symbol,
+        )
         return InstrumentRef(
             symbol=symbol,
             instrument_id=symbol,
-            venue=Venue.KRX,
-            asset_class=AssetClass.EQUITY,
-            instrument_type=InstrumentType.EQUITY,
+            venue=venue,
+            asset_class=asset_class,
+            instrument_type=resolved_instrument_type,
+            provider=provider,
+            canonical_symbol=canonical,
         )
 
     def _normalize_event_types(self, event_types: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -620,8 +723,43 @@ class CollectorControlPlaneService:
         normalized = str(event_name or "").strip().lower()
         return EVENT_TYPE_ALIASES.get(normalized, normalized)
 
-    def _normalize_market_scope(self, market_scope: str) -> str:
-        normalized = market_scope.strip().lower()
+    def _normalize_market_scope(self, market_scope: str | None, *, provider: Provider = Provider.KXT) -> str:
+        """Normalise KRX selection scope.
+
+        For non-KXT providers market_scope is a KRX-only concept; we store
+        it as the empty string so the field never carries ``krx|nxt|total``
+        semantics on crypto targets (see H23).
+        """
+
+        if provider != Provider.KXT:
+            normalized = (market_scope or "").strip().lower()
+            return normalized  # empty string == not applicable
+        normalized = (market_scope or "").strip().lower()
         if normalized not in SUPPORTED_MARKET_SCOPES:
             raise ValueError(f"unsupported market scope: {market_scope}")
         return normalized
+
+    def _normalize_provider(self, provider: str | Provider | None) -> Provider:
+        if provider is None or provider == "":
+            return Provider.KXT
+        if isinstance(provider, Provider):
+            return provider
+        try:
+            return Provider(str(provider).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"unsupported provider: {provider}") from exc
+
+    def _normalize_instrument_type(
+        self,
+        instrument_type: str | InstrumentType | None,
+        *,
+        provider: Provider,
+    ) -> InstrumentType:
+        if instrument_type is None or instrument_type == "":
+            return InstrumentType.EQUITY if provider == Provider.KXT else InstrumentType.SPOT
+        if isinstance(instrument_type, InstrumentType):
+            return instrument_type
+        try:
+            return InstrumentType(str(instrument_type).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"unsupported instrument_type: {instrument_type}") from exc

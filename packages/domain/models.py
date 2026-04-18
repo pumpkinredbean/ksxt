@@ -6,18 +6,52 @@ from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime
 
-from .enums import AssetClass, InstrumentType, RuntimeState, StorageBindingScope, TradeSide, Venue
+from .enums import AssetClass, InstrumentType, Provider, RuntimeState, StorageBindingScope, TradeSide, Venue
+
+
+def build_canonical_symbol(
+    *,
+    provider: Provider | str | None,
+    venue: Venue | str | None,
+    instrument_type: InstrumentType | str | None,
+    symbol: str,
+) -> str:
+    """Build the canonical multiprovider identity string.
+
+    Format: ``<provider>:<venue>:<instrument_type>:<symbol>``
+
+    Missing axes are normalised to ``unknown``.  The helper is intentionally
+    deterministic and dependency-free so adapters, control-plane, and tests
+    can agree on identity without a shared instance.
+    """
+
+    def _norm(value: object) -> str:
+        if value is None:
+            return "unknown"
+        if hasattr(value, "value"):
+            value = value.value
+        text = str(value).strip().lower()
+        return text or "unknown"
+
+    return f"{_norm(provider)}:{_norm(venue)}:{_norm(instrument_type)}:{symbol}"
 
 
 @dataclass(frozen=True, slots=True)
 class InstrumentRef:
-    """Stable instrument reference independent from adapter-specific symbols."""
+    """Stable instrument reference independent from adapter-specific symbols.
+
+    ``provider`` captures the hub/provider axis (KXT vs CCXT/CCXT Pro).
+    ``canonical_symbol`` is an optional pre-computed multiprovider identity;
+    when omitted callers can derive one via :func:`build_canonical_symbol`.
+    """
 
     symbol: str
     instrument_id: str | None = None
     venue: Venue | None = None
     asset_class: AssetClass | None = None
     instrument_type: InstrumentType | None = None
+    provider: Provider | None = None
+    canonical_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +121,19 @@ class InstrumentSearchResult:
     provider_instrument_id: str | None = None
     venue_code: str | None = None
     is_active: bool = True
+    provider: Provider | None = None
+    canonical_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CollectionTarget:
-    """Collector-owned declaration of what should be streamed upstream."""
+    """Collector-owned declaration of what should be streamed upstream.
+
+    ``provider`` lets the hub route a target to the correct adapter
+    (KXT for KRX equity today, CCXT/CCXT Pro for crypto in the next step).
+    ``market_scope`` remains a KRX-only selector (``krx|nxt|total``) and is
+    treated as not-applicable for non-KRX providers (empty string).
+    """
 
     target_id: str
     instrument: InstrumentRef
@@ -99,6 +141,8 @@ class CollectionTarget:
     event_types: tuple[str, ...]
     owner_service: str = "collector"
     enabled: bool = True
+    provider: Provider | None = None
+    canonical_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

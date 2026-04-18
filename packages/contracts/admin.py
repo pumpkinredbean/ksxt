@@ -47,7 +47,12 @@ class ControlPlaneSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class RecentRuntimeEvent:
-    """Bounded operator-facing event sample from current runtime activity."""
+    """Bounded operator-facing event sample from current runtime activity.
+
+    ``provider`` and ``canonical_symbol`` are additive multiprovider fields.
+    They default to ``None`` so KXT responses stay shape-compatible with the
+    existing admin UI while crypto providers can populate them going forward.
+    """
 
     event_id: str
     topic_name: str
@@ -58,3 +63,5 @@ class RecentRuntimeEvent:
     matched_target_ids: tuple[str, ...] = ()
     payload: dict[str, Any] | None = None
     schema_version: str = "v1"
+    provider: str | None = None
+    canonical_symbol: str | None = None
