@@ -61,7 +61,6 @@ SOURCE_CAPABILITIES: tuple[SourceCapability, ...] = (
         supported_event_types=(
             EventType.TRADE.value,
             EventType.ORDER_BOOK_SNAPSHOT.value,
-            EventType.PROGRAM_TRADE.value,
         ),
         market_scope_required=True,
     ),
@@ -431,7 +430,7 @@ class CollectorControlPlaneService:
             provider=resolved_provider,
         )
         resolved_market_scope = self._normalize_market_scope(market_scope, provider=resolved_provider)
-        normalized_event_types = self._normalize_event_types(
+        normalized_event_types, sanitize_warnings = self._normalize_event_types(
             event_types,
             provider=resolved_provider,
             instrument_type=resolved_instrument_type,
@@ -522,11 +521,17 @@ class CollectorControlPlaneService:
             self._target_errors[resolved_target_id] = apply_error
             self._last_service_error = apply_error
 
+        sanitize_note = "; ".join(sanitize_warnings) if sanitize_warnings else None
+        if apply_error and sanitize_note:
+            combined_warning: str | None = f"{apply_error}; {sanitize_note}"
+        else:
+            combined_warning = apply_error or sanitize_note
+
         return {
             "target": target,
             "status": self._build_target_status(target, apply_error),
             "applied": apply_error is None,
-            "warning": apply_error,
+            "warning": combined_warning,
             "deduplicated_target_ids": tuple(duplicate_target_ids),
             "provider_disabled": provider_disabled_skip,
         }
@@ -1064,7 +1069,15 @@ class CollectorControlPlaneService:
         *,
         provider: Provider | None = None,
         instrument_type: InstrumentType | None = None,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Normalize + validate event_types.
+
+        Returns a ``(normalized, warnings)`` tuple.  ``warnings`` is a
+        tuple of human-readable strings describing silently-dropped
+        events (currently only the KXT/spot ``program_trade`` sanitize
+        path).  All other unsupported combinations continue to raise
+        ``ValueError`` (strict gating preserved for Binance/etc.).
+        """
         available = {event_type.value for event_type in EventType}
         normalized = tuple(
             dict.fromkeys(
@@ -1073,6 +1086,26 @@ class CollectorControlPlaneService:
                 if str(event_type).strip()
             )
         )
+
+        warnings: list[str] = []
+        # Narrow pre-filter: KXT KRX spot does not implement
+        # program_trade in the runtime (_STREAM_KIND_BY_EVENT_NAME only
+        # covers trade + order_book_snapshot).  Silently drop it and
+        # surface a warning so legacy saved drafts still save.
+        if (
+            provider == Provider.KXT
+            and instrument_type == InstrumentType.SPOT
+            and EventType.PROGRAM_TRADE.value in normalized
+        ):
+            normalized = tuple(
+                event_type
+                for event_type in normalized
+                if event_type != EventType.PROGRAM_TRADE.value
+            )
+            warnings.append(
+                "program_trade is not supported by KXT KRX spot runtime; dropped"
+            )
+
         if not normalized:
             raise ValueError("at least one event_type is required")
         invalid = [event_type for event_type in normalized if event_type not in available]
@@ -1100,7 +1133,7 @@ class CollectorControlPlaneService:
                         "event_types not supported by "
                         f"{capability.label}: {', '.join(ungated)}"
                     )
-        return normalized
+        return normalized, tuple(warnings)
 
     def _normalize_event_name(self, event_name: str | None) -> str:
         normalized = str(event_name or "").strip().lower()

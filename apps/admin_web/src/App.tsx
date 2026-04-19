@@ -291,13 +291,18 @@ function TargetsView({
       venue: (inst.venue ?? (t.provider === 'ccxt' ? 'binance' : 'krx')) as string,
       instrument_type: (inst.instrument_type ?? 'spot') as string,
     });
+    const supported = capByKey[matchedKey]?.supported_event_types ?? [];
+    // Intersect stored event_types with currently-advertised capability
+    // so legacy stored values (e.g. program_trade on KXT spot) cannot be
+    // re-submitted from the draft.
+    const intersected = t.event_types.filter((et) => supported.includes(et));
     setDraft({
       targetId: t.target_id,
       capabilityKey: capByKey[matchedKey] ? matchedKey : draft.capabilityKey,
       symbol: t.instrument.symbol,
       rawSymbol: t.instrument.raw_symbol ?? '',
       scope: (t.market_scope || 'total') as MarketScope,
-      eventTypes: t.event_types.length ? t.event_types : (capByKey[matchedKey]?.supported_event_types ?? []),
+      eventTypes: intersected.length ? intersected : supported,
       enabled: t.enabled,
       displayName: name || t.instrument.instrument_id || '',
     });

@@ -68,9 +68,9 @@ class CapabilityMatrixTests(unittest.IsolatedAsyncioTestCase):
         snap = await svc.snapshot()
         caps = {(c.provider, c.venue, c.instrument_type): set(c.supported_event_types) for c in snap.source_capabilities}
 
-        # KXT KRX equity exposes program_trade.
+        # KXT KRX equity does NOT expose program_trade (runtime unsupported).
         self.assertIn(("kxt", "krx", "spot"), caps)
-        self.assertIn("program_trade", caps[("kxt", "krx", "spot")])
+        self.assertNotIn("program_trade", caps[("kxt", "krx", "spot")])
 
         # Binance spot does NOT expose mark_price / funding_rate / open_interest.
         self.assertIn(("ccxt", "binance", "spot"), caps)

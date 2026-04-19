@@ -536,6 +536,22 @@ class ControlPlaneMatrixTests(unittest.TestCase):
         # spot must NOT expose perpetual-only types.
         self.assertNotIn("mark_price", supported)
 
+    def test_kxt_krx_spot_matrix_matches_runtime(self) -> None:
+        """KXT KRX spot capability is bounded by what the kxt runtime
+        actually implements (trade + order_book_snapshot).  program_trade
+        must NOT be advertised — see H32."""
+        from src.collector_control_plane import capability_for
+
+        cap = capability_for(provider="kxt", venue="krx", instrument_type="spot")
+        self.assertIsNotNone(cap)
+        supported = set(cap.supported_event_types)
+        self.assertTrue(
+            supported <= {"trade", "order_book_snapshot"},
+            f"KXT KRX spot supported_event_types must be a subset of "
+            f"{{trade, order_book_snapshot}}, got {supported}",
+        )
+        self.assertNotIn("program_trade", supported)
+
     def test_event_type_enum_has_all_names(self) -> None:
         from packages.contracts.events import EventType
 
