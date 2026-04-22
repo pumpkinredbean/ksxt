@@ -39,6 +39,7 @@ from typing import Any, Iterable
 
 from packages.contracts.admin import (
     ChartPanelSpec,
+    ChartSeriesBinding,
     IndicatorInstanceSpec,
     IndicatorOutputEnvelope,
     IndicatorScriptSpec,
@@ -507,7 +508,7 @@ class ChartsStateStore:
             return
         for entry in data.get("panels") or []:
             try:
-                panel = ChartPanelSpec(**entry)
+                panel = _panel_spec_from_entry(entry)
                 self._panels[panel.panel_id] = panel
             except Exception:  # noqa: BLE001
                 continue
@@ -785,3 +786,68 @@ def new_script_id() -> str:
 
 def new_instance_id() -> str:
     return f"inst-{uuid.uuid4().hex[:10]}"
+
+
+# ─── Panel persistence helpers ──────────────────────────────────────────────
+
+
+_CHART_SERIES_BINDING_FIELDS: frozenset[str] = frozenset(
+    {
+        "binding_id",
+        "source_kind",
+        "target_id",
+        "symbol",
+        "provider",
+        "event_name",
+        "field_name",
+        "output_name",
+        "axis",
+        "color",
+        "label",
+        "visible",
+    }
+)
+
+_CHART_PANEL_FIELDS: frozenset[str] = frozenset(
+    {
+        "panel_id",
+        "chart_type",
+        "symbol",
+        "source",
+        "series_ref",
+        "x",
+        "y",
+        "w",
+        "h",
+        "title",
+        "notes",
+        "series_bindings",
+    }
+)
+
+
+def _series_binding_from_entry(entry: Any) -> ChartSeriesBinding:
+    """Reconstruct a :class:`ChartSeriesBinding` from a persisted dict.
+
+    Unknown keys are filtered defensively so forward-compatible
+    snapshots do not break old deployments and vice-versa.
+    """
+    if isinstance(entry, ChartSeriesBinding):
+        return entry
+    if not isinstance(entry, dict):
+        raise ValueError("series_binding entry must be a dict")
+    filtered = {k: v for k, v in entry.items() if k in _CHART_SERIES_BINDING_FIELDS}
+    return ChartSeriesBinding(**filtered)
+
+
+def _panel_spec_from_entry(entry: dict) -> ChartPanelSpec:
+    """Reconstruct a :class:`ChartPanelSpec` tolerating new/old shapes."""
+    filtered = {k: v for k, v in entry.items() if k in _CHART_PANEL_FIELDS}
+    bindings = filtered.get("series_bindings")
+    if bindings:
+        filtered["series_bindings"] = tuple(
+            _series_binding_from_entry(b) for b in bindings
+        )
+    else:
+        filtered["series_bindings"] = ()
+    return ChartPanelSpec(**filtered)

@@ -137,29 +137,65 @@ class SeriesPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class ChartSeriesBinding:
+    """Per-series binding inside a :class:`ChartPanelSpec`.
+
+    A panel may carry multiple series (e.g. a candle base plus line
+    overlays).  Each binding selects exactly one data source:
+
+    * ``source_kind = "raw"`` → the frontend reads from the raw-event
+      SSE stream for ``event_name``; scalar overlays pick
+      ``field_name`` out of the payload.
+    * ``source_kind = "builtin"`` → ``target_id`` is the built-in key
+      (e.g. ``"obi"``) and ``output_name`` selects which output stream
+      to render.
+    * ``source_kind = "script"`` → ``target_id`` is the activated
+      indicator ``instance_id`` and ``output_name`` is the logical
+      output stream (``"value"`` by default).
+    """
+
+    binding_id: str
+    source_kind: str
+    target_id: str = ""
+    symbol: str = ""
+    provider: str = ""
+    event_name: str = ""
+    field_name: str = ""
+    output_name: str = ""
+    axis: str = "left"
+    color: str = ""
+    label: str = ""
+    visible: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class ChartPanelSpec:
     """Admin-UI persisted panel descriptor.
 
     Layout fields (``x``, ``y``, ``w``, ``h``) are integers in a 12-column
     grid, matching ``react-grid-layout`` semantics.  ``chart_type`` is
-    ``"line"`` or ``"candle"``.  ``source`` selects the input stream
-    (``"raw_event"`` or ``"indicator_output"``).  ``series_ref`` is a
-    lightweight opaque string used by the frontend to bind the panel to
-    a specific series (event_name for raw, or indicator_instance_id for
-    indicator output).
+    ``"line"`` or ``"candle"``.  ``source`` selects the legacy input
+    stream (``"raw_event"`` or ``"indicator_output"``) for single-series
+    back-compat.
+
+    ``series_bindings`` is the canonical multi-series model.  When it
+    is non-empty the frontend renders one series per binding on the
+    same chart.  ``series_ref`` is kept as a legacy opaque string so
+    previously persisted panels continue to load round-trip.
     """
 
     panel_id: str
     chart_type: str
     symbol: str
-    source: str
-    series_ref: str
+    source: str = "raw_event"
+    series_ref: str = ""
     x: int = 0
     y: int = 0
     w: int = 6
     h: int = 6
     title: str | None = None
     notes: str | None = None
+    series_bindings: tuple[ChartSeriesBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -71,6 +71,7 @@ from apps.collector.runtime import CollectorRuntime, SUPPORTED_MARKET_SCOPES
 from packages.adapters import build_default_registry
 from packages.contracts.admin import (
     ChartPanelSpec,
+    ChartSeriesBinding,
     IndicatorInstanceSpec,
     IndicatorScriptSpec,
 )
@@ -765,6 +766,33 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
     body = await request.json()
     try:
         panel_id = (body.get("panel_id") or "").strip() or new_panel_id()
+        raw_bindings = body.get("series_bindings") or ()
+        bindings: tuple[ChartSeriesBinding, ...]
+        if isinstance(raw_bindings, (list, tuple)):
+            parsed: list[ChartSeriesBinding] = []
+            for entry in raw_bindings:
+                if not isinstance(entry, dict):
+                    continue
+                parsed.append(
+                    ChartSeriesBinding(
+                        binding_id=str(entry.get("binding_id") or "").strip()
+                        or f"bind-{uuid.uuid4().hex[:10]}",
+                        source_kind=str(entry.get("source_kind") or "raw"),
+                        target_id=str(entry.get("target_id") or ""),
+                        symbol=str(entry.get("symbol") or "").strip(),
+                        provider=str(entry.get("provider") or ""),
+                        event_name=str(entry.get("event_name") or ""),
+                        field_name=str(entry.get("field_name") or ""),
+                        output_name=str(entry.get("output_name") or ""),
+                        axis=str(entry.get("axis") or "left"),
+                        color=str(entry.get("color") or ""),
+                        label=str(entry.get("label") or ""),
+                        visible=bool(entry.get("visible", True)),
+                    )
+                )
+            bindings = tuple(parsed)
+        else:
+            bindings = ()
         spec = ChartPanelSpec(
             panel_id=panel_id,
             chart_type=str(body.get("chart_type") or "line"),
@@ -777,11 +805,18 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
             h=int(body.get("h") or 6),
             title=body.get("title"),
             notes=body.get("notes"),
+            series_bindings=bindings,
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid panel: {exc}") from exc
     if spec.chart_type not in {"line", "candle"}:
         raise HTTPException(status_code=400, detail="chart_type must be 'line' or 'candle'")
+    for binding in spec.series_bindings:
+        if binding.source_kind not in {"raw", "builtin", "script"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid series_binding.source_kind: {binding.source_kind}",
+            )
     saved = await charts_state_store.upsert_panel(spec)
     return JSONResponse({"panel": jsonable_encoder(saved)})
 
@@ -902,7 +937,9 @@ async def admin_charts_errors() -> JSONResponse:
 # /admin/charts/stream as a named SSE `raw_event` frame. The candle
 # panels in the admin charts view consume this directly so they render
 # from the real raw OHLCV feed rather than from a synthesized series.
-_ADMIN_CHARTS_RAW_EVENT_NAMES: frozenset[str] = frozenset({"ohlcv", "trade"})
+_ADMIN_CHARTS_RAW_EVENT_NAMES: frozenset[str] = frozenset(
+    {"ohlcv", "trade", "mark_price", "funding_rate"}
+)
 
 
 def _format_admin_charts_raw_event_frame(event: Any) -> str:

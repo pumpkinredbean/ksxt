@@ -106,6 +106,94 @@ class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
             store = ChartsStateStore(path=Path(tmp) / "s.json")
             self.assertFalse(await store.delete_script("builtin.obi"))
 
+    async def test_panel_with_series_bindings_round_trip(self) -> None:
+        from packages.contracts.admin import ChartPanelSpec, ChartSeriesBinding
+        from src.indicator_runtime import ChartsStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "admin_charts.json"
+            store = ChartsStateStore(path=path)
+
+            panel = ChartPanelSpec(
+                panel_id="p-multi",
+                chart_type="candle",
+                symbol="BTCUSDT",
+                source="raw_event",
+                series_ref="",  # legacy field intentionally empty
+                x=0, y=0, w=8, h=10,
+                title="candle + overlay",
+                series_bindings=(
+                    ChartSeriesBinding(
+                        binding_id="b-base",
+                        source_kind="raw",
+                        event_name="ohlcv",
+                        symbol="BTCUSDT",
+                        axis="left",
+                        label="OHLCV",
+                    ),
+                    ChartSeriesBinding(
+                        binding_id="b-mark",
+                        source_kind="raw",
+                        event_name="mark_price",
+                        field_name="value",
+                        symbol="BTCUSDT",
+                        axis="right",
+                        color="#ffb000",
+                        label="Mark",
+                    ),
+                ),
+            )
+            await store.upsert_panel(panel)
+
+            # Reload from disk into a fresh store.
+            store2 = ChartsStateStore(path=path)
+            store2.load()
+            panels = await store2.list_panels()
+            self.assertEqual(len(panels), 1)
+            reloaded = panels[0]
+            self.assertEqual(reloaded.panel_id, "p-multi")
+            self.assertEqual(len(reloaded.series_bindings), 2)
+            self.assertEqual(reloaded.series_bindings[0].source_kind, "raw")
+            self.assertEqual(reloaded.series_bindings[0].event_name, "ohlcv")
+            self.assertEqual(reloaded.series_bindings[1].field_name, "value")
+            self.assertEqual(reloaded.series_bindings[1].axis, "right")
+            self.assertEqual(reloaded.series_bindings[1].color, "#ffb000")
+
+    async def test_legacy_panel_without_series_bindings_still_loads(self) -> None:
+        """Panels persisted by step1 (no series_bindings key) must keep loading."""
+        import json
+
+        from src.indicator_runtime import ChartsStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "admin_charts.json"
+            snapshot = {
+                "panels": [
+                    {
+                        "panel_id": "legacy",
+                        "chart_type": "line",
+                        "symbol": "005930",
+                        "source": "raw_event",
+                        "series_ref": "trade",
+                        "x": 0, "y": 0, "w": 6, "h": 6,
+                        "title": "legacy panel",
+                        "notes": None,
+                        # series_bindings intentionally absent
+                    }
+                ],
+                "scripts": [],
+                "instances": [],
+                "schema_version": "v1",
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            store = ChartsStateStore(path=path)
+            store.load()
+            panels = await store.list_panels()
+            self.assertEqual(len(panels), 1)
+            self.assertEqual(panels[0].panel_id, "legacy")
+            self.assertEqual(panels[0].series_ref, "trade")
+            self.assertEqual(panels[0].series_bindings, ())
+
 
 if __name__ == "__main__":
     unittest.main()

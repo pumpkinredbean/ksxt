@@ -14,6 +14,14 @@ from datetime import datetime
 
 
 class FormatRawEventFrameTests(unittest.TestCase):
+    def test_raw_event_allow_list_includes_ohlcv_trade_mark_funding(self) -> None:
+        from apps.collector.service import _ADMIN_CHARTS_RAW_EVENT_NAMES
+
+        self.assertIn("ohlcv", _ADMIN_CHARTS_RAW_EVENT_NAMES)
+        self.assertIn("trade", _ADMIN_CHARTS_RAW_EVENT_NAMES)
+        self.assertIn("mark_price", _ADMIN_CHARTS_RAW_EVENT_NAMES)
+        self.assertIn("funding_rate", _ADMIN_CHARTS_RAW_EVENT_NAMES)
+
     def test_frame_carries_symbol_timestamp_and_full_payload(self) -> None:
         from packages.contracts.admin import RecentRuntimeEvent
         from apps.collector.service import _format_admin_charts_raw_event_frame
@@ -135,6 +143,62 @@ class AdminChartsStreamRealFanOutTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["payload"]["timeframe"], "1m")
 
             # Close the generator cleanly.
+            await iterator.aclose()
+        finally:
+            await dashboard_service.aclose()
+
+    async def test_mark_price_is_emitted_as_raw_event_sse_frame(self) -> None:
+        from apps.collector.service import admin_charts_stream, dashboard_service
+
+        await dashboard_service.start()
+        try:
+            class _Req:
+                async def is_disconnected(self) -> bool:
+                    return False
+
+            response = await admin_charts_stream(_Req())  # type: ignore[arg-type]
+            iterator = response.body_iterator
+
+            preface = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
+            if isinstance(preface, bytes):
+                preface = preface.decode()
+            self.assertIn("event: connected", preface)
+
+            next_chunk_task = asyncio.create_task(iterator.__anext__())
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            await dashboard_service._control_plane.record_runtime_event(  # noqa: SLF001
+                symbol="BTCUSDT",
+                market_scope="total",
+                event_name="mark_price",
+                payload={"value": 12345.67, "occurred_at": "2026-04-21T12:01:00+00:00"},
+            )
+
+            raw_frame = None
+            first = await asyncio.wait_for(next_chunk_task, timeout=5.0)
+            if isinstance(first, bytes):
+                first = first.decode()
+            chunks = [first]
+            for _ in range(4):
+                if any(c.startswith("event: raw_event") for c in chunks):
+                    break
+                more = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
+                if isinstance(more, bytes):
+                    more = more.decode()
+                chunks.append(more)
+            for c in chunks:
+                if c.startswith("event: raw_event"):
+                    raw_frame = c
+                    break
+
+            self.assertIsNotNone(raw_frame, "mark_price raw_event frame was not emitted")
+            assert raw_frame is not None
+            data_line = next(ln for ln in raw_frame.split("\n") if ln.startswith("data: "))
+            data = json.loads(data_line[len("data: "):])
+            self.assertEqual(data["event_name"], "mark_price")
+            self.assertEqual(data["payload"]["value"], 12345.67)
+
             await iterator.aclose()
         finally:
             await dashboard_service.aclose()
