@@ -520,6 +520,21 @@ async def admin_charts_errors_relay() -> JSONResponse:
     return await _relay_collector_json("GET", "/admin/charts/errors")
 
 
+@app.get("/api/admin/charts/indicators")
+async def admin_charts_indicators_relay(
+    panel_id: str | None = Query(None),
+) -> JSONResponse:
+    params: dict[str, Any] = {}
+    if panel_id:
+        params["panel_id"] = panel_id
+    return await _relay_collector_json("GET", "/admin/charts/indicators", params=params)
+
+
+@app.get("/api/admin/charts/event-schemas")
+async def admin_charts_event_schemas_relay() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/charts/event-schemas")
+
+
 @app.get("/api/admin/charts/stream")
 async def admin_charts_stream_relay(request: Request) -> StreamingResponse:
     async def event_generator() -> Any:

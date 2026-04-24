@@ -1,27 +1,45 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import GridLayout, { Layout } from 'react-grid-layout';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import GridLayout, { Layout, WidthProvider } from 'react-grid-layout';
 import Editor from '@monaco-editor/react';
-import { createChart, IChartApi, ISeriesApi, LineData, CandlestickData, UTCTimestamp } from 'lightweight-charts';
+import {
+  createChart,
+  IChartApi,
+  ISeriesApi,
+  LineData,
+  CandlestickData,
+  UTCTimestamp,
+} from 'lightweight-charts';
 
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
 
 import hubStubSource from '../assets/hub-stub.py?raw';
 
-// ─── API contract types ───────────────────────────────────────────────────
+// ─── Contract types (indicator-first) ────────────────────────────────────
 
-export interface ChartPanelSpec {
-  panel_id: string;
-  chart_type: 'line' | 'candle';
-  symbol: string;
-  source: string;
-  series_ref: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  title?: string | null;
-  notes?: string | null;
+export interface ChartInputBinding {
+  slot_name: string;
+  target_id: string;
+  event_name: string;
+  field_name: string;
+}
+
+export interface ChartSeriesBinding {
+  binding_id: string;
+  indicator_ref: string;
+  instance_id?: string;
+  input_bindings: ChartInputBinding[];
+  param_values: Record<string, unknown>;
+  output_name: string;
+  axis: 'left' | 'right';
+  color: string;
+  label: string;
+  visible: boolean;
+}
+
+export interface ChartPanelBaseFeed {
+  target_id: string;
+  event_name: string;
 }
 
 interface IndicatorScriptSpec {
@@ -40,6 +58,56 @@ interface IndicatorInstanceSpec {
   market_scope: string;
   params: Record<string, unknown>;
   enabled: boolean;
+}
+
+export interface ChartPanelSpec {
+  panel_id: string;
+  chart_type: 'line' | 'candle';
+  symbol: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  title?: string | null;
+  notes?: string | null;
+  series_bindings: ChartSeriesBinding[];
+  base_feed?: ChartPanelBaseFeed | null;
+  scripts: IndicatorScriptSpec[];
+  instances: IndicatorInstanceSpec[];
+}
+
+interface IndicatorInputDecl {
+  slot_name: string;
+  event_names: string[];
+  field_hints: string[];
+  required: boolean;
+}
+interface IndicatorParamDecl {
+  name: string;
+  kind: 'int' | 'float' | 'str' | 'bool' | 'enum';
+  default?: unknown;
+  min?: number;
+  max?: number;
+  choices?: unknown[];
+  label?: string;
+  help?: string;
+}
+interface IndicatorOutputDecl {
+  name: string;
+  kind: string;
+  label: string;
+  is_primary: boolean;
+}
+interface IndicatorDeclaration {
+  inputs: IndicatorInputDecl[];
+  params: IndicatorParamDecl[];
+  outputs: IndicatorOutputDecl[];
+}
+interface IndicatorCatalogEntry {
+  script_id: string;
+  name: string;
+  builtin: boolean;
+  declaration: IndicatorDeclaration | null;
 }
 
 interface IndicatorErrorRow {
@@ -74,12 +142,14 @@ interface IndicatorOutputEnvelope {
 const LS_PREFIX = 'korea-market-data-hub.admin-charts';
 const LS_PREFERRED = `${LS_PREFIX}.preferredLayout.v1`;
 const LS_WORKING = `${LS_PREFIX}.workingLayout.v1`;
+const LS_SEED_DONE = `${LS_PREFIX}.seed.v3.done`;
 
-// Default layout shipped with the SPA — used when neither preferred nor
-// working layout is present in localStorage.
 const DEFAULT_LAYOUT: Layout[] = [];
+const DEFAULT_COLORS = ['#4aa3ff', '#f59e0b', '#22c55e', '#ef4444', '#a855f7', '#14b8a6'];
 
-// ─── Small helpers ────────────────────────────────────────────────────────
+const ResponsiveGridLayout = WidthProvider(GridLayout);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
 
 async function apiJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
@@ -108,7 +178,7 @@ function loadLayout(key: string): Layout[] | null {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) return parsed as Layout[];
   } catch {
-    // ignore
+    /* ignore */
   }
   return null;
 }
@@ -117,11 +187,197 @@ function saveLayout(key: string, layout: Layout[]): void {
   try {
     localStorage.setItem(key, JSON.stringify(layout));
   } catch {
-    // ignore quota
+    /* ignore */
   }
 }
 
-// ─── Panel content: line / candle chart ───────────────────────────────────
+function paramValuesToTuples(values: Record<string, unknown>): Array<[string, unknown]> {
+  return Object.entries(values);
+}
+
+function paramValuesFromAny(raw: unknown): Record<string, unknown> {
+  if (!raw) return {};
+  if (Array.isArray(raw)) {
+    const out: Record<string, unknown> = {};
+    for (const pv of raw) {
+      if (Array.isArray(pv) && pv.length >= 2) out[String(pv[0])] = pv[1];
+    }
+    return out;
+  }
+  if (typeof raw === 'object') return raw as Record<string, unknown>;
+  return {};
+}
+
+function normalizePanel(raw: any): ChartPanelSpec {
+  return {
+    panel_id: raw.panel_id,
+    chart_type: raw.chart_type,
+    symbol: raw.symbol ?? '',
+    x: raw.x ?? 0,
+    y: raw.y ?? 0,
+    w: raw.w ?? 12,
+    h: raw.h ?? 14,
+    title: raw.title ?? null,
+    notes: raw.notes ?? null,
+    base_feed: raw.base_feed
+      ? {
+          target_id: raw.base_feed.target_id ?? '',
+          event_name: raw.base_feed.event_name ?? 'ohlcv',
+        }
+      : null,
+    scripts: Array.isArray(raw.scripts) ? raw.scripts : [],
+    instances: Array.isArray(raw.instances) ? raw.instances : [],
+    series_bindings: Array.isArray(raw.series_bindings)
+      ? raw.series_bindings.map((b: any) => ({
+          binding_id: b.binding_id ?? uid('bind'),
+          indicator_ref: b.indicator_ref ?? '',
+          instance_id: b.instance_id ?? '',
+          input_bindings: Array.isArray(b.input_bindings)
+            ? b.input_bindings.map((s: any) => ({
+                slot_name: s.slot_name ?? '',
+                target_id: s.target_id ?? '',
+                event_name: s.event_name ?? '',
+                field_name: s.field_name ?? '',
+              }))
+            : [],
+          param_values: paramValuesFromAny(b.param_values),
+          output_name: b.output_name ?? '',
+          axis: b.axis ?? 'left',
+          color: b.color ?? '',
+          label: b.label ?? '',
+          visible: b.visible !== false,
+        }))
+      : [],
+  };
+}
+
+function panelToWire(panel: ChartPanelSpec): unknown {
+  return {
+    ...panel,
+    base_feed: panel.base_feed ?? undefined,
+    series_bindings: panel.series_bindings.map((b) => ({
+      ...b,
+      param_values: paramValuesToTuples(b.param_values),
+    })),
+  };
+}
+
+function extractScalar(payload: Record<string, unknown> | null | undefined, fieldName: string): number | null {
+  if (!payload) return null;
+  if (fieldName && fieldName in payload) {
+    const v = Number(payload[fieldName]);
+    return Number.isFinite(v) ? v : null;
+  }
+  return null;
+}
+
+// ─── Selector helpers (target-aware events + schema-aware fields) ────────
+
+export interface TargetCapabilityRef {
+  provider: string;
+  venue: string;
+  instrument_type: string;
+  supported_event_types: string[];
+}
+
+export interface TargetRef {
+  target_id: string;
+  instrument: { symbol: string; instrument_type?: string | null; venue?: string | null };
+  provider?: string | null;
+}
+
+/** Map a target → its source-capability row from the snapshot. */
+export function findCapabilityForTarget(
+  target: TargetRef | undefined,
+  capabilities: TargetCapabilityRef[],
+): TargetCapabilityRef | null {
+  if (!target) return null;
+  const provider = String(target.provider ?? '').toLowerCase();
+  const venue = String(target.instrument?.venue ?? '').toLowerCase();
+  const itype = String(target.instrument?.instrument_type ?? '').toLowerCase();
+  // Strict triple match first.
+  let hit = capabilities.find(
+    (c) => c.provider === provider && c.venue === venue && c.instrument_type === itype,
+  );
+  if (hit) return hit;
+  // Fallback: provider + instrument_type only (some legacy targets miss venue).
+  hit = capabilities.find((c) => c.provider === provider && c.instrument_type === itype);
+  return hit ?? null;
+}
+
+/** Intersect indicator-slot allowed events with the target's capability events. */
+export function computeAllowedEvents(
+  slotEventNames: readonly string[],
+  capability: TargetCapabilityRef | null,
+): string[] {
+  const slot = (slotEventNames ?? []).map(String);
+  if (!capability) return [...slot];
+  const capSet = new Set(capability.supported_event_types.map(String));
+  const filtered = slot.filter((e) => capSet.has(e));
+  // If the intersection is empty (e.g. capability missing for legacy
+  // targets) fall back to the slot list rather than disabling the UI.
+  return filtered.length > 0 ? filtered : [...slot];
+}
+
+/** Sample observed field names from any raw events seen for this target+event. */
+export function sampledPayloadFields(
+  target: TargetRef | undefined,
+  eventName: string,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): string[] {
+  if (!target || !eventName) return [];
+  const candidateKeys = [
+    `${target.target_id}:${eventName}`,
+    `${target.instrument.symbol}:${eventName}`,
+  ];
+  const out = new Set<string>();
+  const internal = new Set([
+    '__payload', 'symbol', 'event_name', 'timestamp', 'published_at', 'occurred_at',
+  ]);
+  for (const key of candidateKeys) {
+    const rows = rawEvents.get(key);
+    if (!rows || rows.length === 0) continue;
+    // Sample most recent few rows.
+    for (const row of rows.slice(-5)) {
+      const payload = ((row as any).__payload ?? row) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(payload)) {
+        if (internal.has(k)) continue;
+        // Only surface scalar-projectable fields.
+        if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+          out.add(k);
+        }
+      }
+    }
+  }
+  return Array.from(out);
+}
+
+/** Compute the field options for a slot using the documented priority chain. */
+export function computeAllowedFields(
+  eventName: string,
+  target: TargetRef | undefined,
+  declHints: readonly string[],
+  canonicalSchemas: Record<string, string[]>,
+  rawEvents: Map<string, Array<Record<string, unknown>>>,
+): { fields: string[]; layer: 'canonical' | 'runtime' | 'sampled' | 'hints' | 'empty' } {
+  if (!eventName) return { fields: [], layer: 'empty' };
+  // (a) canonical/contracts schema
+  const canonical = canonicalSchemas[eventName];
+  if (canonical && canonical.length > 0) return { fields: [...canonical], layer: 'canonical' };
+  // (b) runtime/indicator declaration: the IndicatorInputDecl ships
+  //     event_names + field_hints together, so when canonical is silent
+  //     we treat the declaration's hints as the runtime-decl layer.
+  //     (Distinguished from layer (d) only by event match: declHints
+  //     is provided per-slot already.)
+  // (c) sampled payload fields
+  const sampled = sampledPayloadFields(target, eventName, rawEvents);
+  if (sampled.length > 0) return { fields: sampled, layer: 'sampled' };
+  // (d) declaration field_hints fallback
+  if (declHints && declHints.length > 0) return { fields: [...declHints], layer: 'hints' };
+  return { fields: [], layer: 'empty' };
+}
+
+// ─── ChartPanel ───────────────────────────────────────────────────────────
 
 function ChartPanel({
   spec,
@@ -130,11 +386,12 @@ function ChartPanel({
 }: {
   spec: ChartPanelSpec;
   indicatorOutputs: Map<string, SeriesPoint[]>;
-  rawEvents: Map<string, unknown[]>;
+  rawEvents: Map<string, Array<Record<string, unknown>>>;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<'Line'> | ISeriesApi<'Candlestick'> | null>(null);
+  const baseSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const seriesRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map());
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -142,57 +399,659 @@ function ChartPanel({
       layout: { background: { color: '#1a1a1a' }, textColor: '#d0d0d0' },
       grid: { vertLines: { color: '#262626' }, horzLines: { color: '#262626' } },
       timeScale: { timeVisible: true, secondsVisible: true },
+      rightPriceScale: { visible: true },
+      leftPriceScale: { visible: true },
       autoSize: true,
     });
     chartRef.current = chart;
-    if (spec.chart_type === 'candle') {
-      seriesRef.current = chart.addCandlestickSeries();
-    } else {
-      seriesRef.current = chart.addLineSeries({ color: '#4aa3ff', lineWidth: 2 });
-    }
+    // ResizeObserver on the host to trigger chart.resize defensively.
+    const ro = new ResizeObserver(() => {
+      if (!containerRef.current || !chartRef.current) return;
+      const { width, height } = containerRef.current.getBoundingClientRect();
+      if (width > 0 && height > 0) chartRef.current.resize(width, height);
+    });
+    ro.observe(containerRef.current);
     return () => {
+      ro.disconnect();
       chart.remove();
       chartRef.current = null;
-      seriesRef.current = null;
+      baseSeriesRef.current = null;
+      seriesRef.current = new Map();
     };
-  }, [spec.chart_type]);
+  }, []);
 
-  // Feed data.
+  // Render base feed (candle).
   useEffect(() => {
-    if (!seriesRef.current) return;
-    if (spec.chart_type === 'line') {
-      const pts = indicatorOutputs.get(spec.series_ref) ?? [];
-      const data: LineData[] = pts.map((p) => ({
-        time: Math.floor(new Date(p.timestamp).getTime() / 1000) as UTCTimestamp,
-        value: p.value,
-      }));
-      // Sort by time for lightweight-charts contract.
-      data.sort((a, b) => (a.time as number) - (b.time as number));
-      (seriesRef.current as ISeriesApi<'Line'>).setData(data);
-    } else if (spec.chart_type === 'candle') {
-      const key = `${spec.symbol}:${spec.series_ref}`;
-      const rows = (rawEvents.get(key) ?? []) as Array<Record<string, any>>;
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (spec.chart_type === 'candle' && spec.base_feed?.target_id) {
+      if (!baseSeriesRef.current) {
+        baseSeriesRef.current = chart.addCandlestickSeries();
+      }
+      const key = `${spec.base_feed.target_id}:${spec.base_feed.event_name || 'ohlcv'}`;
+      const rows = rawEvents.get(key) ?? [];
       const data: CandlestickData[] = rows
         .map((r) => {
-          const ts = r.timestamp ?? r.published_at ?? r.time;
+          const ts = (r as any).timestamp ?? (r as any).published_at;
           return {
-            time: Math.floor(new Date(ts).getTime() / 1000) as UTCTimestamp,
-            open: Number(r.open),
-            high: Number(r.high),
-            low: Number(r.low),
-            close: Number(r.close),
+            time: Math.floor(new Date(ts as string).getTime() / 1000) as UTCTimestamp,
+            open: Number((r as any).open),
+            high: Number((r as any).high),
+            low: Number((r as any).low),
+            close: Number((r as any).close),
           };
         })
         .filter((d) => Number.isFinite(d.open) && Number.isFinite(d.close))
         .sort((a, b) => (a.time as number) - (b.time as number));
-      (seriesRef.current as ISeriesApi<'Candlestick'>).setData(data);
+      baseSeriesRef.current.setData(data);
+    } else if (baseSeriesRef.current) {
+      try { chart.removeSeries(baseSeriesRef.current); } catch { /* ignore */ }
+      baseSeriesRef.current = null;
     }
-  }, [spec.chart_type, spec.series_ref, spec.symbol, indicatorOutputs, rawEvents]);
+  }, [spec.chart_type, spec.base_feed?.target_id, spec.base_feed?.event_name, rawEvents]);
 
-  return <div className="chart-host" ref={containerRef} />;
+  // Render line bindings.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const current = seriesRef.current;
+    const desired = new Set<string>();
+
+    spec.series_bindings.forEach((binding, idx) => {
+      if (!binding.visible) return;
+      desired.add(binding.binding_id);
+      let api = current.get(binding.binding_id);
+      const color = binding.color || DEFAULT_COLORS[idx % DEFAULT_COLORS.length];
+      if (!api) {
+        api = chart.addLineSeries({
+          color,
+          lineWidth: 2,
+          priceScaleId: binding.axis === 'right' ? 'right' : 'left',
+        });
+        current.set(binding.binding_id, api);
+      } else {
+        try {
+          api.applyOptions({
+            color,
+            priceScaleId: binding.axis === 'right' ? 'right' : 'left',
+          });
+        } catch { /* ignore */ }
+      }
+
+      let data: LineData[] = [];
+      if (binding.indicator_ref === 'builtin.raw') {
+        // Pull from raw stream using the source slot.
+        const slot = binding.input_bindings.find((s) => s.slot_name === 'source')
+          ?? binding.input_bindings[0];
+        if (slot && slot.target_id) {
+          const key = `${slot.target_id}:${slot.event_name || 'trade'}`;
+          const rows = rawEvents.get(key) ?? [];
+          const field = String(binding.param_values.field ?? slot.field_name ?? '');
+          data = rows
+            .map((r) => {
+              const ts = (r as any).timestamp ?? (r as any).published_at;
+              const payload = ((r as any).__payload ?? r) as Record<string, unknown>;
+              const value = extractScalar(payload, field);
+              if (value == null || !ts) return null;
+              return {
+                time: Math.floor(new Date(ts as string).getTime() / 1000) as UTCTimestamp,
+                value,
+              } as LineData;
+            })
+            .filter((d): d is LineData => d != null)
+            .sort((a, b) => (a.time as number) - (b.time as number));
+        }
+      } else if (binding.instance_id) {
+        // Indicator output stream.
+        const pts = indicatorOutputs.get(binding.instance_id) ?? [];
+        data = pts
+          .map((p) => ({
+            time: Math.floor(new Date(p.timestamp).getTime() / 1000) as UTCTimestamp,
+            value: p.value,
+          }))
+          .sort((a, b) => (a.time as number) - (b.time as number));
+      }
+      api.setData(data);
+    });
+
+    // Remove stale.
+    for (const [id, api] of Array.from(current.entries())) {
+      if (!desired.has(id)) {
+        try { chart.removeSeries(api); } catch { /* ignore */ }
+        current.delete(id);
+      }
+    }
+  }, [spec.series_bindings, indicatorOutputs, rawEvents]);
+
+  return (
+    <>
+      <div className="chart-host" ref={containerRef} />
+      {spec.series_bindings.length > 0 && (
+        <div className="chart-legend">
+          {spec.series_bindings
+            .filter((b) => b.visible)
+            .map((b, idx) => (
+              <span key={b.binding_id} className="chart-legend-item">
+                <span
+                  className="chart-legend-dot"
+                  style={{ background: b.color || DEFAULT_COLORS[idx % DEFAULT_COLORS.length] }}
+                />
+                {b.label || b.indicator_ref || 'series'}
+              </span>
+            ))}
+        </div>
+      )}
+    </>
+  );
 }
 
-// ─── Main ChartsView ──────────────────────────────────────────────────────
+// ─── PanelInspector (declaration-driven) ─────────────────────────────────
+
+function ParamWidget({
+  decl,
+  value,
+  onChange,
+}: {
+  decl: IndicatorParamDecl;
+  value: unknown;
+  onChange: (v: unknown) => void;
+}) {
+  const eff = value === undefined ? decl.default : value;
+  if (decl.kind === 'enum' && Array.isArray(decl.choices)) {
+    return (
+      <select value={String(eff ?? '')} onChange={(e) => onChange(e.target.value)}>
+        {decl.choices.map((c) => (
+          <option key={String(c)} value={String(c)}>
+            {String(c)}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  if (decl.kind === 'bool') {
+    return (
+      <input
+        type="checkbox"
+        checked={Boolean(eff)}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+    );
+  }
+  if (decl.kind === 'int' || decl.kind === 'float') {
+    return (
+      <input
+        type="number"
+        value={eff == null ? '' : String(eff)}
+        min={decl.min as number | undefined}
+        max={decl.max as number | undefined}
+        step={decl.kind === 'int' ? 1 : 'any'}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          onChange(Number.isFinite(n) ? n : 0);
+        }}
+      />
+    );
+  }
+  return (
+    <input
+      type="text"
+      value={eff == null ? '' : String(eff)}
+      onChange={(e) => onChange(e.target.value)}
+    />
+  );
+}
+
+function PanelInspector({
+  panel,
+  targets,
+  indicators,
+  capabilities,
+  canonicalSchemas,
+  rawEvents,
+  onChange,
+  onDelete,
+  onAddPanelScript,
+  onSavePanelScript,
+}: {
+  panel: ChartPanelSpec;
+  targets: Array<{ target_id: string; instrument: { symbol: string; instrument_type?: string | null; venue?: string | null }; provider?: string | null }>;
+  indicators: IndicatorCatalogEntry[];
+  capabilities: TargetCapabilityRef[];
+  canonicalSchemas: Record<string, string[]>;
+  rawEvents: Map<string, Array<Record<string, unknown>>>;
+  onChange: (next: ChartPanelSpec) => void;
+  onDelete: () => void;
+  onAddPanelScript: () => void;
+  onSavePanelScript: (script: IndicatorScriptSpec) => void;
+}) {
+  const [editingScriptId, setEditingScriptId] = useState<string | null>(null);
+  const [editorSource, setEditorSource] = useState<string>(hubStubSource);
+  const [editorName, setEditorName] = useState<string>('');
+  const [editorClassName, setEditorClassName] = useState<string>('MyInd');
+
+  function commit(next: ChartPanelSpec) {
+    onChange(next);
+  }
+
+  function updateBinding(idx: number, patch: Partial<ChartSeriesBinding>) {
+    const next = panel.series_bindings.map((b, i) => (i === idx ? { ...b, ...patch } : b));
+    commit({ ...panel, series_bindings: next });
+  }
+
+  function removeBinding(idx: number) {
+    commit({ ...panel, series_bindings: panel.series_bindings.filter((_, i) => i !== idx) });
+  }
+
+  function addBinding() {
+    const fresh: ChartSeriesBinding = {
+      binding_id: uid('bind'),
+      indicator_ref: 'builtin.raw',
+      instance_id: '',
+      input_bindings: [
+        { slot_name: 'source', target_id: targets[0]?.target_id ?? '', event_name: 'trade', field_name: 'price' },
+      ],
+      param_values: { field: 'price' },
+      output_name: 'value',
+      axis: 'left',
+      color: '',
+      label: '',
+      visible: true,
+    };
+    commit({ ...panel, series_bindings: [...panel.series_bindings, fresh] });
+  }
+
+  function setBaseFeed(patch: Partial<ChartPanelBaseFeed>) {
+    const cur = panel.base_feed ?? { target_id: '', event_name: 'ohlcv' };
+    commit({ ...panel, base_feed: { ...cur, ...patch } });
+  }
+
+  function getDeclaration(ref: string): IndicatorDeclaration | null {
+    return indicators.find((i) => i.script_id === ref)?.declaration ?? null;
+  }
+
+  return (
+    <div className="charts-inspector">
+      <div className="inspector-section">
+        <div className="inspector-section-head">
+          <span className="eyebrow">Panel</span>
+          <button type="button" className="sm-btn danger-sm" onClick={onDelete}>
+            패널 삭제
+          </button>
+        </div>
+        <label className="field">
+          <span>Title</span>
+          <input
+            value={panel.title ?? ''}
+            onChange={(e) => commit({ ...panel, title: e.target.value })}
+          />
+        </label>
+        <div className="binding-row-grid">
+          <div className="field">
+            <span>Type</span>
+            <span className="badge muted">{panel.chart_type}</span>
+          </div>
+          <label className="field">
+            <span>Symbol (label)</span>
+            <input
+              value={panel.symbol ?? ''}
+              onChange={(e) => commit({ ...panel, symbol: e.target.value })}
+            />
+          </label>
+        </div>
+      </div>
+
+      {panel.chart_type === 'candle' && (
+        <div className="inspector-section">
+          <span className="eyebrow">Base feed (OHLCV)</span>
+          <label className="field">
+            <span>Target</span>
+            <select
+              value={panel.base_feed?.target_id ?? ''}
+              onChange={(e) => setBaseFeed({ target_id: e.target.value })}
+            >
+              <option value="">— target —</option>
+              {targets.map((t) => (
+                <option key={t.target_id} value={t.target_id}>
+                  {t.instrument.symbol} ({t.target_id.slice(0, 8)})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Event</span>
+            <select
+              value={panel.base_feed?.event_name ?? 'ohlcv'}
+              onChange={(e) => setBaseFeed({ event_name: e.target.value })}
+            >
+              <option value="ohlcv">ohlcv</option>
+            </select>
+          </label>
+        </div>
+      )}
+
+      <div className="inspector-section">
+        <div className="inspector-section-head">
+          <span className="eyebrow">
+            {panel.chart_type === 'candle' ? 'Overlays' : 'Series'} ({panel.series_bindings.length})
+          </span>
+          <button type="button" className="sm-btn" onClick={addBinding}>
+            + 추가
+          </button>
+        </div>
+        {panel.series_bindings.length === 0 && (
+          <div className="empty-row">
+            {panel.chart_type === 'candle' ? '오버레이가 없습니다.' : '시리즈가 없습니다.'}
+          </div>
+        )}
+        {panel.series_bindings.map((binding, idx) => {
+          const decl = getDeclaration(binding.indicator_ref);
+          return (
+            <div key={binding.binding_id} className="binding-row">
+              <div className="binding-row-head">
+                <strong>#{idx + 1}</strong>
+                <button type="button" className="sm-btn danger-sm" onClick={() => removeBinding(idx)}>
+                  삭제
+                </button>
+              </div>
+              <label className="field">
+                <span>Indicator</span>
+                <select
+                  value={binding.indicator_ref}
+                  onChange={(e) => {
+                    const ref = e.target.value;
+                    const d = getDeclaration(ref);
+                    const defaults: Record<string, unknown> = {};
+                    for (const p of d?.params ?? []) defaults[p.name] = p.default;
+                    const slots = (d?.inputs ?? []).map((inp) => ({
+                      slot_name: inp.slot_name,
+                      target_id: targets[0]?.target_id ?? '',
+                      event_name: inp.event_names[0] ?? '',
+                      field_name: inp.field_hints[0] ?? '',
+                    }));
+                    updateBinding(idx, {
+                      indicator_ref: ref,
+                      input_bindings: slots,
+                      param_values: defaults,
+                      output_name:
+                        d?.outputs.find((o) => o.is_primary)?.name ?? d?.outputs[0]?.name ?? '',
+                    });
+                  }}
+                >
+                  <option value="">— select —</option>
+                  {indicators.map((i) => (
+                    <option key={i.script_id} value={i.script_id}>
+                      {i.name} {i.builtin ? '(built-in)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {/* Inputs */}
+              {decl && decl.inputs.length > 0 && (
+                <div className="field">
+                  <span>Inputs</span>
+                  {decl.inputs.map((inp) => {
+                    const slot = binding.input_bindings.find((s) => s.slot_name === inp.slot_name) ?? {
+                      slot_name: inp.slot_name,
+                      target_id: '',
+                      event_name: inp.event_names[0] ?? '',
+                      field_name: '',
+                    };
+                    const slotTarget = targets.find((t) => t.target_id === slot.target_id);
+                    const capability = findCapabilityForTarget(slotTarget, capabilities);
+                    const allowedEvents = computeAllowedEvents(inp.event_names, capability);
+                    const fieldRes = computeAllowedFields(
+                      slot.event_name,
+                      slotTarget,
+                      inp.field_hints,
+                      canonicalSchemas,
+                      rawEvents,
+                    );
+                    function patchSlot(patch: Partial<ChartInputBinding>) {
+                      const next = { ...slot, ...patch };
+                      // Cascade: target change → re-evaluate event; event change
+                      // (or stale event after target change) → re-evaluate field.
+                      const newTarget = targets.find((t) => t.target_id === next.target_id);
+                      const newCap = findCapabilityForTarget(newTarget, capabilities);
+                      const newAllowedEvents = computeAllowedEvents(inp.event_names, newCap);
+                      if (next.event_name && !newAllowedEvents.includes(next.event_name)) {
+                        next.event_name = newAllowedEvents[0] ?? '';
+                      }
+                      const newFieldRes = computeAllowedFields(
+                        next.event_name,
+                        newTarget,
+                        inp.field_hints,
+                        canonicalSchemas,
+                        rawEvents,
+                      );
+                      if (next.field_name && !newFieldRes.fields.includes(next.field_name)) {
+                        // Stale field: pick first canonical/runtime/sampled candidate
+                        // rather than holding a value the new event cannot supply.
+                        next.field_name = newFieldRes.fields[0] ?? '';
+                      }
+                      const others = binding.input_bindings.filter((s) => s.slot_name !== inp.slot_name);
+                      updateBinding(idx, { input_bindings: [...others, next] });
+                    }
+                    return (
+                      <div key={inp.slot_name} className="binding-row-grid">
+                        <label className="field">
+                          <span>{inp.slot_name}: target</span>
+                          <select
+                            value={slot.target_id}
+                            onChange={(e) => patchSlot({ target_id: e.target.value })}
+                          >
+                            <option value="">— target —</option>
+                            {targets.map((t) => (
+                              <option key={t.target_id} value={t.target_id}>
+                                {t.instrument.symbol}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="field">
+                          <span>event</span>
+                          <select
+                            value={allowedEvents.includes(slot.event_name) ? slot.event_name : ''}
+                            onChange={(e) => patchSlot({ event_name: e.target.value })}
+                            disabled={allowedEvents.length === 0}
+                          >
+                            {!allowedEvents.includes(slot.event_name) && (
+                              <option value="">— event —</option>
+                            )}
+                            {allowedEvents.map((e) => (
+                              <option key={e} value={e}>{e}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="field" style={{ gridColumn: '1 / span 2' }}>
+                          <span>field <small className="hint-inline">({fieldRes.layer})</small></span>
+                          <input
+                            list={`fields-${binding.binding_id}-${inp.slot_name}`}
+                            value={slot.field_name}
+                            onChange={(e) => patchSlot({ field_name: e.target.value })}
+                          />
+                          <datalist id={`fields-${binding.binding_id}-${inp.slot_name}`}>
+                            {fieldRes.fields.map((h) => (
+                              <option key={h} value={h} />
+                            ))}
+                          </datalist>
+                        </label>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Params */}
+              {decl && decl.params.length > 0 && (
+                <div className="field">
+                  <span>Params</span>
+                  {decl.params.map((p) => (
+                    <label key={p.name} className="field">
+                      <span>{p.label || p.name}</span>
+                      <ParamWidget
+                        decl={p}
+                        value={binding.param_values[p.name]}
+                        onChange={(v) =>
+                          updateBinding(idx, {
+                            param_values: { ...binding.param_values, [p.name]: v },
+                          })
+                        }
+                      />
+                      {p.help && <small className="hint-inline">{p.help}</small>}
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              {/* Output */}
+              {decl && decl.outputs.length > 0 && (
+                <label className="field">
+                  <span>Output</span>
+                  <select
+                    value={binding.output_name}
+                    onChange={(e) => updateBinding(idx, { output_name: e.target.value })}
+                  >
+                    {decl.outputs.map((o) => (
+                      <option key={o.name} value={o.name}>
+                        {o.label || o.name} ({o.kind})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
+              {/* Style */}
+              <div className="binding-row-grid">
+                <label className="field">
+                  <span>Axis</span>
+                  <select
+                    value={binding.axis}
+                    onChange={(e) => updateBinding(idx, { axis: e.target.value as 'left' | 'right' })}
+                  >
+                    <option value="left">left</option>
+                    <option value="right">right</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Color</span>
+                  <input
+                    type="color"
+                    value={binding.color || DEFAULT_COLORS[idx % DEFAULT_COLORS.length]}
+                    onChange={(e) => updateBinding(idx, { color: e.target.value })}
+                  />
+                </label>
+              </div>
+              <label className="field">
+                <span>Label</span>
+                <input
+                  value={binding.label}
+                  onChange={(e) => updateBinding(idx, { label: e.target.value })}
+                />
+              </label>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={binding.visible}
+                  onChange={(e) => updateBinding(idx, { visible: e.target.checked })}
+                />
+                <span>visible</span>
+              </label>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="inspector-section">
+        <div className="inspector-section-head">
+          <span className="eyebrow">Scripts ({panel.scripts.length})</span>
+          <button
+            type="button"
+            className="sm-btn"
+            onClick={() => {
+              setEditingScriptId(uid('script'));
+              setEditorSource(hubStubSource);
+              setEditorName('새 인디케이터');
+              setEditorClassName('MyInd');
+              onAddPanelScript();
+            }}
+          >
+            + 새 스크립트
+          </button>
+        </div>
+        {panel.scripts.length === 0 && (
+          <div className="empty-row">패널 전용 커스텀 인디케이터가 없습니다.</div>
+        )}
+        {panel.scripts.map((s) => (
+          <div key={s.script_id} className="binding-row">
+            <strong>{s.name}</strong>
+            <small className="hint-inline">{s.class_name}</small>
+            <div className="row-actions">
+              <button
+                type="button"
+                className="sm-btn"
+                onClick={() => {
+                  setEditingScriptId(s.script_id);
+                  setEditorSource(s.source || hubStubSource);
+                  setEditorName(s.name);
+                  setEditorClassName(s.class_name);
+                }}
+              >
+                편집
+              </button>
+            </div>
+          </div>
+        ))}
+        {editingScriptId && (
+          <div className="script-editor">
+            <label className="field">
+              <span>이름</span>
+              <input value={editorName} onChange={(e) => setEditorName(e.target.value)} />
+            </label>
+            <label className="field">
+              <span>클래스명</span>
+              <input value={editorClassName} onChange={(e) => setEditorClassName(e.target.value)} />
+            </label>
+            <Editor
+              height="280px"
+              defaultLanguage="python"
+              value={editorSource}
+              onChange={(v) => setEditorSource(v ?? '')}
+              theme="vs-dark"
+              options={{ minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false }}
+            />
+            <div className="form-actions">
+              <button
+                type="button"
+                onClick={() => {
+                  onSavePanelScript({
+                    script_id: editingScriptId,
+                    name: editorName,
+                    source: editorSource,
+                    class_name: editorClassName,
+                    builtin: false,
+                  });
+                  setEditingScriptId(null);
+                }}
+              >
+                저장
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setEditingScriptId(null)}
+              >
+                취소
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Main ChartsView ─────────────────────────────────────────────────────
 
 interface ChartsViewProps {
   capabilities: Array<{
@@ -204,48 +1063,42 @@ interface ChartsViewProps {
   }>;
   targets: Array<{
     target_id: string;
-    instrument: { symbol: string; instrument_type?: string | null };
+    instrument: { symbol: string; instrument_type?: string | null; venue?: string | null };
     provider?: string | null;
   }>;
 }
 
 export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
   const [panels, setPanels] = useState<ChartPanelSpec[]>([]);
-  const [scripts, setScripts] = useState<IndicatorScriptSpec[]>([]);
-  const [instances, setInstances] = useState<IndicatorInstanceSpec[]>([]);
+  const [indicatorsByPanel, setIndicatorsByPanel] = useState<Map<string, IndicatorCatalogEntry[]>>(
+    new Map(),
+  );
+  const [globalIndicators, setGlobalIndicators] = useState<IndicatorCatalogEntry[]>([]);
   const [errors, setErrors] = useState<IndicatorErrorRow[]>([]);
   const [banner, setBanner] = useState('');
   const [bannerError, setBannerError] = useState(false);
+  const [selectedPanelId, setSelectedPanelId] = useState<string | null>(null);
+  const [canonicalSchemas, setCanonicalSchemas] = useState<Record<string, string[]>>({});
 
-  // Layout state (react-grid-layout)
   const [layout, setLayout] = useState<Layout[]>(
     () => loadLayout(LS_WORKING) ?? loadLayout(LS_PREFERRED) ?? DEFAULT_LAYOUT,
   );
 
-  // Indicator output buffer (keyed by instance_id), bounded per series.
   const [indicatorOutputs, setIndicatorOutputs] = useState<Map<string, SeriesPoint[]>>(new Map());
-  const [rawEvents, setRawEvents] = useState<Map<string, unknown[]>>(() => new Map());
+  const [rawEvents, setRawEvents] = useState<Map<string, Array<Record<string, unknown>>>>(new Map());
 
-  // Script editor state.
-  const [editingScriptId, setEditingScriptId] = useState<string | null>(null);
-  const [editorSource, setEditorSource] = useState<string>(hubStubSource);
-  const [editorName, setEditorName] = useState<string>('');
-  const [editorClassName, setEditorClassName] = useState<string>('MyOBI');
-  const [validationErrors, setValidationErrors] = useState<string[]>([]);
+  const seedAttemptedRef = useRef(false);
 
-  // Refresh core state.
   const refresh = useCallback(async () => {
     try {
-      const [p, s, i, e] = await Promise.all([
-        apiJson<{ panels: ChartPanelSpec[] }>('/api/admin/charts/panels'),
-        apiJson<{ scripts: IndicatorScriptSpec[] }>('/api/admin/charts/scripts'),
-        apiJson<{ instances: IndicatorInstanceSpec[] }>('/api/admin/charts/instances'),
+      const [p, e, ind] = await Promise.all([
+        apiJson<{ panels: any[] }>('/api/admin/charts/panels'),
         apiJson<{ instances: IndicatorErrorRow[] }>('/api/admin/charts/errors'),
+        apiJson<{ indicators: IndicatorCatalogEntry[] }>('/api/admin/charts/indicators'),
       ]);
-      setPanels(p.panels ?? []);
-      setScripts(s.scripts ?? []);
-      setInstances(i.instances ?? []);
+      setPanels((p.panels ?? []).map(normalizePanel));
       setErrors(e.instances ?? []);
+      setGlobalIndicators(ind.indicators ?? []);
     } catch (err) {
       setBanner(err instanceof Error ? err.message : 'charts state load failed');
       setBannerError(true);
@@ -256,7 +1109,43 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
     void refresh();
   }, [refresh]);
 
-  // Subscribe to indicator output SSE.
+  // Canonical event-field schema (priority layer (a) for the field selector).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await apiJson<{ schemas: Record<string, string[]> }>(
+          '/api/admin/charts/event-schemas',
+        );
+        if (!cancelled) setCanonicalSchemas(resp.schemas ?? {});
+      } catch {
+        /* leave empty; downstream falls through to runtime/sampled/hints */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Per-panel indicators fetch (built-ins + panel scripts).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const next = new Map<string, IndicatorCatalogEntry[]>();
+      for (const panel of panels) {
+        try {
+          const resp = await apiJson<{ indicators: IndicatorCatalogEntry[] }>(
+            `/api/admin/charts/indicators?panel_id=${encodeURIComponent(panel.panel_id)}`,
+          );
+          next.set(panel.panel_id, resp.indicators ?? []);
+        } catch {
+          next.set(panel.panel_id, globalIndicators);
+        }
+      }
+      if (!cancelled) setIndicatorsByPanel(next);
+    })();
+    return () => { cancelled = true; };
+  }, [panels, globalIndicators]);
+
+  // SSE stream.
   useEffect(() => {
     const es = new EventSource('/api/admin/charts/stream');
     es.addEventListener('indicator_output', (evt: MessageEvent) => {
@@ -264,33 +1153,29 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
         const payload = JSON.parse(evt.data) as IndicatorOutputEnvelope;
         setIndicatorOutputs((prev) => {
           const next = new Map(prev);
-          const key = payload.instance_id;
-          const cur = next.get(key) ?? [];
-          const merged = [...cur, payload.point].slice(-500);
-          next.set(key, merged);
+          const cur = next.get(payload.instance_id) ?? [];
+          next.set(payload.instance_id, [...cur, payload.point].slice(-500));
           return next;
         });
-      } catch {
-        // ignore
-      }
+      } catch { /* ignore */ }
     });
     es.addEventListener('raw_event', (evt: MessageEvent) => {
       try {
         const envelope = JSON.parse(evt.data) as {
           symbol?: string;
           event_name?: string;
-          timestamp?: string | number | null;
-          published_at?: string | number | null;
+          timestamp?: string | null;
+          published_at?: string | null;
           payload?: Record<string, unknown> | null;
         };
         const symbol = envelope.symbol;
         const eventName = envelope.event_name;
         if (!symbol || !eventName) return;
-        const key = `${symbol}:${eventName}`;
-        // Flatten payload onto the row so ChartPanel can read OHLCV
-        // fields (r.open, r.high, …) directly alongside timestamp.
+        // Index by symbol+event so legacy lookups work; ChartPanel uses target_id.
+        // We index by both target_id (when panel uses one) and symbol fallback.
         const row = {
           ...(envelope.payload ?? {}),
+          __payload: envelope.payload ?? {},
           symbol,
           event_name: eventName,
           timestamp: envelope.timestamp,
@@ -298,43 +1183,54 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
         } as Record<string, unknown>;
         setRawEvents((prev) => {
           const next = new Map(prev);
-          const cur = next.get(key) ?? [];
-          const merged = [...cur, row].slice(-500);
-          next.set(key, merged);
+          // Index by every known target_id whose panel binding refers to this symbol+event.
+          // For simplicity we index by both `<symbol>:<event>` and `<targetId>:<event>`
+          // — the target-id index is set when bindings know their target_id.
+          const symKey = `${symbol}:${eventName}`;
+          const cur = next.get(symKey) ?? [];
+          next.set(symKey, [...cur, row].slice(-500));
           return next;
         });
-      } catch {
-        // ignore
-      }
+      } catch { /* ignore */ }
     });
     return () => es.close();
   }, []);
 
-  // Capability lookup for panel-type disabling (candle requires OHLCV).
-  const capsBySymbol = useMemo(() => {
-    const map = new Map<string, Set<string>>();
-    for (const t of targets) {
-      const provider = (t.provider ?? 'kxt').toLowerCase();
-      const venue = provider === 'kxt' ? 'krx' : 'binance';
-      const itype = (t.instrument.instrument_type ?? 'spot').toLowerCase();
-      const cap = capabilities.find(
-        (c) => c.provider === provider && c.venue === venue && c.instrument_type === itype,
-      );
-      if (cap) {
-        map.set(t.instrument.symbol, new Set(cap.supported_event_types));
-      }
-    }
-    return map;
-  }, [capabilities, targets]);
-
-  function panelSupportsCandle(symbol: string): boolean {
-    return capsBySymbol.get(symbol)?.has('ohlcv') ?? false;
-  }
-
-  // ── layout sync ──
+  // For panels that use target_id keying in bindings, mirror raw events under
+  // `<target_id>:<event_name>` so ChartPanel lookup works.
   useEffect(() => {
-    // Keep layout rows in sync with panel count: add rows for any panels
-    // missing from layout; drop rows referencing deleted panels.
+    setRawEvents((prev) => {
+      const next = new Map(prev);
+      for (const panel of panels) {
+        for (const b of panel.series_bindings) {
+          for (const slot of b.input_bindings) {
+            if (!slot.target_id || !slot.event_name) continue;
+            const tgt = targets.find((t) => t.target_id === slot.target_id);
+            if (!tgt) continue;
+            const symKey = `${tgt.instrument.symbol}:${slot.event_name}`;
+            const tgtKey = `${slot.target_id}:${slot.event_name}`;
+            if (next.has(symKey) && !next.has(tgtKey)) {
+              next.set(tgtKey, next.get(symKey) ?? []);
+            }
+          }
+        }
+        if (panel.base_feed?.target_id) {
+          const tgt = targets.find((t) => t.target_id === panel.base_feed!.target_id);
+          if (tgt) {
+            const symKey = `${tgt.instrument.symbol}:${panel.base_feed.event_name || 'ohlcv'}`;
+            const tgtKey = `${panel.base_feed.target_id}:${panel.base_feed.event_name || 'ohlcv'}`;
+            if (next.has(symKey) && !next.has(tgtKey)) {
+              next.set(tgtKey, next.get(symKey) ?? []);
+            }
+          }
+        }
+      }
+      return next;
+    });
+  }, [panels, targets, rawEvents.size]);
+
+  // Sync layout with panels.
+  useEffect(() => {
     setLayout((prev) => {
       const byId = new Map(prev.map((l) => [l.i, l] as const));
       let nextY = prev.reduce((m, l) => Math.max(m, l.y + l.h), 0);
@@ -348,74 +1244,131 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
             i: panel.panel_id,
             x: panel.x ?? 0,
             y: nextY,
-            w: Math.max(2, panel.w ?? 6),
-            h: Math.max(3, panel.h ?? 6),
+            w: Math.max(6, panel.w ?? 12),
+            h: Math.max(8, panel.h ?? 14),
           });
-          nextY += Math.max(3, panel.h ?? 6);
+          nextY += Math.max(8, panel.h ?? 14);
         }
       }
       return merged;
     });
   }, [panels]);
 
-  // Persist working layout on every change; preferred layout only on explicit save.
   useEffect(() => {
     saveLayout(LS_WORKING, layout);
   }, [layout]);
 
-  // ── actions ──
-
-  async function addPanel(chartType: 'line' | 'candle') {
-    const defaultSymbol = targets[0]?.instrument.symbol ?? '';
-    try {
-      const resp = await apiJson<{ panel: ChartPanelSpec }>(
-        '/api/admin/charts/panels',
-        {
+  // First-run seeder (v3).
+  useEffect(() => {
+    if (seedAttemptedRef.current) return;
+    if (panels.length > 0) {
+      seedAttemptedRef.current = true;
+      return;
+    }
+    if (typeof localStorage !== 'undefined' && localStorage.getItem(LS_SEED_DONE)) {
+      seedAttemptedRef.current = true;
+      return;
+    }
+    if (targets.length === 0) return;
+    seedAttemptedRef.current = true;
+    const tgt = targets[0];
+    const sym = tgt.instrument.symbol;
+    void (async () => {
+      try {
+        // Panel 1: candle with base_feed.
+        await apiJson<{ panel: any }>('/api/admin/charts/panels', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            chart_type: chartType,
-            symbol: defaultSymbol,
-            source: chartType === 'candle' ? 'raw_event' : 'indicator_output',
-            series_ref: chartType === 'candle' ? 'ohlcv' : '',
-            x: 0,
-            y: 0,
-            w: 6,
-            h: 6,
-            title: chartType === 'candle' ? 'OHLCV' : 'Indicator',
+            chart_type: 'candle',
+            symbol: sym,
+            x: 0, y: 0, w: 12, h: 14,
+            title: `${sym} Candle`,
+            base_feed: { target_id: tgt.target_id, event_name: 'ohlcv' },
+            series_bindings: [],
           }),
-        },
-      );
-      setPanels((prev) => [...prev, resp.panel]);
-    } catch (err) {
-      setBanner(err instanceof Error ? err.message : 'add panel failed');
-      setBannerError(true);
-    }
-  }
-
-  async function updatePanel(next: ChartPanelSpec) {
-    try {
-      const resp = await apiJson<{ panel: ChartPanelSpec }>(
-        '/api/admin/charts/panels',
-        {
+        });
+        // Panel 2: line with single raw passthrough binding.
+        await apiJson<{ panel: any }>('/api/admin/charts/panels', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(next),
-        },
-      );
-      setPanels((prev) => prev.map((p) => (p.panel_id === resp.panel.panel_id ? resp.panel : p)));
+          body: JSON.stringify({
+            chart_type: 'line',
+            symbol: sym,
+            x: 0, y: 14, w: 12, h: 14,
+            title: `${sym} Trades`,
+            series_bindings: [
+              {
+                binding_id: uid('bind'),
+                indicator_ref: 'builtin.raw',
+                input_bindings: [
+                  { slot_name: 'source', target_id: tgt.target_id, event_name: 'trade', field_name: 'price' },
+                ],
+                param_values: [['field', 'price']],
+                output_name: 'value',
+                axis: 'left',
+                color: '',
+                label: 'trade.price',
+                visible: true,
+              },
+            ],
+          }),
+        });
+        try { localStorage.setItem(LS_SEED_DONE, '1'); } catch { /* ignore */ }
+        await refresh();
+      } catch { /* ignore */ }
+    })();
+  }, [panels.length, targets, refresh]);
+
+  // ── actions ──
+
+  async function persistPanel(next: ChartPanelSpec) {
+    try {
+      const resp = await apiJson<{ panel: any }>('/api/admin/charts/panels', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(panelToWire(next)),
+      });
+      const normalized = normalizePanel(resp.panel);
+      setPanels((prev) => prev.map((p) => (p.panel_id === normalized.panel_id ? normalized : p)));
     } catch (err) {
       setBanner(err instanceof Error ? err.message : 'update panel failed');
       setBannerError(true);
     }
   }
 
+  async function addPanel(chartType: 'line' | 'candle') {
+    const tgt = targets[0];
+    try {
+      const body: any = {
+        chart_type: chartType,
+        symbol: tgt?.instrument.symbol ?? '',
+        x: 0, y: 0, w: 12, h: 14,
+        title: chartType === 'candle' ? 'Candle' : 'Line',
+        series_bindings: [],
+      };
+      if (chartType === 'candle' && tgt) {
+        body.base_feed = { target_id: tgt.target_id, event_name: 'ohlcv' };
+      }
+      const resp = await apiJson<{ panel: any }>('/api/admin/charts/panels', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const normalized = normalizePanel(resp.panel);
+      setPanels((prev) => [...prev, normalized]);
+      setSelectedPanelId(normalized.panel_id);
+    } catch (err) {
+      setBanner(err instanceof Error ? err.message : 'add panel failed');
+      setBannerError(true);
+    }
+  }
+
   async function removePanel(panelId: string) {
     try {
-      await apiJson(`/api/admin/charts/panels/${encodeURIComponent(panelId)}`, {
-        method: 'DELETE',
-      });
+      await apiJson(`/api/admin/charts/panels/${encodeURIComponent(panelId)}`, { method: 'DELETE' });
       setPanels((prev) => prev.filter((p) => p.panel_id !== panelId));
+      if (selectedPanelId === panelId) setSelectedPanelId(null);
     } catch (err) {
       setBanner(err instanceof Error ? err.message : 'delete panel failed');
       setBannerError(true);
@@ -424,7 +1377,7 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
 
   function savePreferredLayout() {
     saveLayout(LS_PREFERRED, layout);
-    setBanner('선호 레이아웃이 저장되었습니다.');
+    setBanner('선호 레이아웃 저장됨.');
     setBannerError(false);
   }
 
@@ -432,381 +1385,136 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
     const preferred = loadLayout(LS_PREFERRED);
     if (preferred) {
       setLayout(preferred);
-      setBanner('선호 레이아웃으로 복원했습니다.');
+      setBanner('선호 레이아웃 복원됨.');
       setBannerError(false);
     }
   }
 
-  // ── Script editor actions ──
-
-  function startNewScript() {
-    setEditingScriptId(uid('script'));
-    setEditorSource(hubStubSource);
-    setEditorName('새 인디케이터');
-    setEditorClassName('MyOBI');
-    setValidationErrors([]);
+  const persistTimeoutRef = useRef<number | null>(null);
+  function onInspectorChange(next: ChartPanelSpec) {
+    setPanels((prev) => prev.map((p) => (p.panel_id === next.panel_id ? next : p)));
+    if (persistTimeoutRef.current != null) window.clearTimeout(persistTimeoutRef.current);
+    persistTimeoutRef.current = window.setTimeout(() => void persistPanel(next), 350);
   }
 
-  function editScript(script: IndicatorScriptSpec) {
-    setEditingScriptId(script.script_id);
-    setEditorSource(script.source || hubStubSource);
-    setEditorName(script.name);
-    setEditorClassName(script.class_name);
-    setValidationErrors([]);
-  }
-
-  async function saveScript() {
-    if (!editingScriptId) return;
-    try {
-      setValidationErrors([]);
-      const resp = await apiJson<{ script: IndicatorScriptSpec }>(
-        '/api/admin/charts/scripts',
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            script_id: editingScriptId,
-            name: editorName,
-            source: editorSource,
-            class_name: editorClassName,
-          }),
-        },
-      );
-      setScripts((prev) => {
-        const has = prev.some((s) => s.script_id === resp.script.script_id);
-        return has
-          ? prev.map((s) => (s.script_id === resp.script.script_id ? resp.script : s))
-          : [...prev, resp.script];
-      });
-      setBanner('스크립트 저장 완료.');
-      setBannerError(false);
-    } catch (err: any) {
-      const payload = err?.payload as { errors?: string[] } | undefined;
-      if (payload?.errors) {
-        setValidationErrors(payload.errors);
-      } else {
-        setValidationErrors([err instanceof Error ? err.message : 'save failed']);
-      }
-    }
-  }
-
-  async function deleteScript(script: IndicatorScriptSpec) {
-    if (script.builtin) return;
-    if (!confirm(`'${script.name}' 스크립트를 삭제할까요?`)) return;
-    try {
-      await apiJson(`/api/admin/charts/scripts/${encodeURIComponent(script.script_id)}`, {
-        method: 'DELETE',
-      });
-      setScripts((prev) => prev.filter((s) => s.script_id !== script.script_id));
-      setInstances((prev) => prev.filter((i) => i.script_id !== script.script_id));
-      if (editingScriptId === script.script_id) {
-        setEditingScriptId(null);
-      }
-    } catch (err) {
-      setBanner(err instanceof Error ? err.message : 'delete failed');
-      setBannerError(true);
-    }
-  }
-
-  // ── Instance activate ──
-
-  async function activateInstance(scriptId: string, symbol: string, topN: number) {
-    try {
-      const resp = await apiJson<{ instance: IndicatorInstanceSpec }>(
-        '/api/admin/charts/instances',
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            script_id: scriptId,
-            symbol,
-            market_scope: '',
-            params: scriptId === 'builtin.obi' ? { top_n: topN } : {},
-            enabled: true,
-          }),
-        },
-      );
-      setInstances((prev) => {
-        const has = prev.some((i) => i.instance_id === resp.instance.instance_id);
-        return has
-          ? prev.map((i) => (i.instance_id === resp.instance.instance_id ? resp.instance : i))
-          : [...prev, resp.instance];
-      });
-      await refresh();
-    } catch (err) {
-      setBanner(err instanceof Error ? err.message : 'activate failed');
-      setBannerError(true);
-    }
-  }
-
-  async function deactivateInstance(id: string) {
-    try {
-      await apiJson(`/api/admin/charts/instances/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      setInstances((prev) => prev.filter((i) => i.instance_id !== id));
-    } catch (err) {
-      setBanner(err instanceof Error ? err.message : 'deactivate failed');
-      setBannerError(true);
-    }
-  }
-
-  // ── Render ──
-
-  const symbols = useMemo(
-    () => Array.from(new Set(targets.map((t) => t.instrument.symbol))),
-    [targets],
-  );
-
-  const instancesBySymbol = useMemo(() => {
-    const map = new Map<string, IndicatorInstanceSpec[]>();
-    for (const inst of instances) {
-      const arr = map.get(inst.symbol) ?? [];
-      arr.push(inst);
-      map.set(inst.symbol, arr);
-    }
-    return map;
-  }, [instances]);
+  const selectedPanel = panels.find((p) => p.panel_id === selectedPanelId) ?? null;
+  const layoutKey = `lk-${panels.length}`;
 
   return (
     <div className="col-stack charts-view">
-      {banner && (
-        <div className={bannerError ? 'banner error' : 'banner'}>{banner}</div>
-      )}
+      {banner && <div className={bannerError ? 'banner error' : 'banner'}>{banner}</div>}
 
-      <section className="panel">
-        <div className="panel-head">
-          <span className="eyebrow">Charts Layout</span>
-          <div className="row-actions">
-            <button type="button" className="sm-btn" onClick={() => void addPanel('line')}>
-              + Line 패널
-            </button>
-            <button type="button" className="sm-btn" onClick={() => void addPanel('candle')}>
-              + Candle 패널
-            </button>
-            <button type="button" className="sm-btn" onClick={savePreferredLayout}>
-              레이아웃 저장
-            </button>
-            <button type="button" className="sm-btn" onClick={restorePreferredLayout}>
-              레이아웃 복원
-            </button>
+      <div className="charts-main-grid">
+        <section className="panel">
+          <div className="panel-head">
+            <span className="eyebrow">Charts Layout</span>
+            <div className="row-actions">
+              <button type="button" className="sm-btn" onClick={() => void addPanel('line')}>
+                + Line 패널
+              </button>
+              <button type="button" className="sm-btn" onClick={() => void addPanel('candle')}>
+                + Candle 패널
+              </button>
+              <button type="button" className="sm-btn" onClick={savePreferredLayout}>
+                레이아웃 저장
+              </button>
+              <button type="button" className="sm-btn" onClick={restorePreferredLayout}>
+                레이아웃 복원
+              </button>
+            </div>
           </div>
-        </div>
 
-        {panels.length === 0 ? (
-          <div className="empty-row">
-            패널이 없습니다. 위의 버튼으로 Line/Candle 패널을 추가하세요.
-          </div>
-        ) : (
-          <GridLayout
-            className="layout"
-            cols={12}
-            rowHeight={40}
-            width={1200}
-            layout={layout}
-            onLayoutChange={(next) => setLayout(next)}
-            draggableHandle=".panel-drag-handle"
-            isDraggable
-            isResizable
-            margin={[8, 8]}
-          >
-            {panels.map((panel) => {
-              const candleDisabled = panel.chart_type === 'candle' && !panelSupportsCandle(panel.symbol);
-              return (
-                <div key={panel.panel_id} className="chart-wrapper">
-                  <div className="chart-wrapper-head panel-drag-handle">
-                    <strong>{panel.title || `${panel.chart_type.toUpperCase()} · ${panel.symbol || '—'}`}</strong>
-                    <div className="row-actions">
-                      <select
-                        value={panel.chart_type}
-                        onChange={(e) => void updatePanel({ ...panel, chart_type: e.target.value as any })}
-                      >
-                        <option value="line">line</option>
-                        <option value="candle" disabled={!panelSupportsCandle(panel.symbol)}>
-                          candle
-                        </option>
-                      </select>
-                      <select
-                        value={panel.symbol}
-                        onChange={(e) => void updatePanel({ ...panel, symbol: e.target.value })}
-                      >
-                        <option value="">— symbol —</option>
-                        {symbols.map((s) => (
-                          <option key={s} value={s}>{s}</option>
-                        ))}
-                      </select>
-                      <select
-                        value={panel.source}
-                        onChange={(e) => void updatePanel({ ...panel, source: e.target.value })}
-                      >
-                        <option value="indicator_output">indicator</option>
-                        <option value="raw_event">raw event</option>
-                      </select>
-                      <select
-                        value={panel.series_ref}
-                        onChange={(e) => void updatePanel({ ...panel, series_ref: e.target.value })}
-                      >
-                        <option value="">— series —</option>
-                        {panel.source === 'indicator_output' &&
-                          (instancesBySymbol.get(panel.symbol) ?? []).map((inst) => (
-                            <option key={inst.instance_id} value={inst.instance_id}>
-                              {scripts.find((s) => s.script_id === inst.script_id)?.name ?? inst.instance_id}
-                            </option>
-                          ))}
-                        {panel.source === 'raw_event' && (
-                          <>
-                            <option value="ohlcv">ohlcv</option>
-                            <option value="trade">trade</option>
-                          </>
-                        )}
-                      </select>
-                      <button
-                        type="button"
-                        className="sm-btn danger-sm"
-                        onClick={() => void removePanel(panel.panel_id)}
-                      >
-                        삭제
-                      </button>
+          {panels.length === 0 ? (
+            <div className="empty-row">패널이 없습니다. + 버튼으로 추가하세요.</div>
+          ) : (
+            <ResponsiveGridLayout
+              key={layoutKey}
+              className="layout"
+              cols={12}
+              rowHeight={40}
+              layout={layout}
+              onLayoutChange={(next) => setLayout(next)}
+              draggableHandle=".panel-drag-handle"
+              isDraggable
+              isResizable
+              useCSSTransforms
+              measureBeforeMount
+              margin={[8, 8]}
+            >
+              {panels.map((panel) => {
+                const isSelected = panel.panel_id === selectedPanelId;
+                return (
+                  <div
+                    key={panel.panel_id}
+                    className={`chart-wrapper${isSelected ? ' selected' : ''}`}
+                    onClick={() => setSelectedPanelId(panel.panel_id)}
+                  >
+                    <div className="chart-wrapper-head">
+                      <span className="panel-drag-handle" title="drag">⋮⋮</span>
+                      <strong>
+                        {panel.title || `${panel.chart_type.toUpperCase()} · ${panel.symbol || '—'}`}
+                      </strong>
+                      <span className="badge muted">{panel.chart_type}</span>
+                      <div className="row-actions" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          className="sm-btn danger-sm"
+                          onClick={() => void removePanel(panel.panel_id)}
+                        >
+                          삭제
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                  {candleDisabled ? (
-                    <div className="empty-row">
-                      이 심볼의 소스는 OHLCV 캔들 스트림을 제공하지 않습니다
-                      (예: KXT KRX spot). line 타입으로 변경하거나 OHLCV를
-                      지원하는 심볼을 선택하세요.
-                    </div>
-                  ) : (
                     <ChartPanel
                       spec={panel}
                       indicatorOutputs={indicatorOutputs}
                       rawEvents={rawEvents}
                     />
-                  )}
-                </div>
-              );
-            })}
-          </GridLayout>
-        )}
-      </section>
+                  </div>
+                );
+              })}
+            </ResponsiveGridLayout>
+          )}
+        </section>
 
-      <section className="panel">
-        <div className="panel-head">
-          <span className="eyebrow">Indicator Scripts</span>
-          <div className="row-actions">
-            <button type="button" className="sm-btn" onClick={startNewScript}>
-              + 새 스크립트
-            </button>
+        <aside className="panel inspector-panel">
+          <div className="panel-head">
+            <span className="eyebrow">Inspector</span>
           </div>
-        </div>
-        <div className="tbl-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>이름</th>
-                <th>클래스</th>
-                <th>built-in</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {scripts.map((s) => (
-                <tr key={s.script_id}>
-                  <td><strong>{s.name}</strong></td>
-                  <td className="mono small">{s.class_name}</td>
-                  <td>{s.builtin ? 'yes' : '—'}</td>
-                  <td>
-                    <div className="row-actions">
-                      <button
-                        type="button"
-                        className="sm-btn"
-                        onClick={() => editScript(s)}
-                        disabled={s.builtin}
-                      >
-                        편집
-                      </button>
-                      <button
-                        type="button"
-                        className="sm-btn danger-sm"
-                        onClick={() => void deleteScript(s)}
-                        disabled={s.builtin}
-                      >
-                        삭제
-                      </button>
-                      <button
-                        type="button"
-                        className="sm-btn"
-                        onClick={() => void activateInstance(s.script_id, symbols[0] ?? '', 5)}
-                        disabled={symbols.length === 0}
-                      >
-                        활성화
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        {editingScriptId && (
-          <div className="script-editor">
-            <div className="field-row">
-              <label className="field">
-                <span>이름</span>
-                <input value={editorName} onChange={(e) => setEditorName(e.target.value)} />
-              </label>
-              <label className="field">
-                <span>클래스명</span>
-                <input
-                  value={editorClassName}
-                  onChange={(e) => setEditorClassName(e.target.value)}
-                  placeholder="MyOBI"
-                />
-              </label>
-            </div>
-            <Editor
-              height="420px"
-              defaultLanguage="python"
-              value={editorSource}
-              onChange={(v) => setEditorSource(v ?? '')}
-              theme="vs-dark"
-              options={{
-                minimap: { enabled: false },
-                fontSize: 13,
-                scrollBeyondLastLine: false,
+          {selectedPanel ? (
+            <PanelInspector
+              panel={selectedPanel}
+              targets={targets}
+              indicators={indicatorsByPanel.get(selectedPanel.panel_id) ?? globalIndicators}
+              capabilities={capabilities}
+              canonicalSchemas={canonicalSchemas}
+              rawEvents={rawEvents}
+              onChange={onInspectorChange}
+              onDelete={() => void removePanel(selectedPanel.panel_id)}
+              onAddPanelScript={() => { /* placeholder; editing gates by inspector state */ }}
+              onSavePanelScript={(script) => {
+                const next = {
+                  ...selectedPanel,
+                  scripts: selectedPanel.scripts.some((s) => s.script_id === script.script_id)
+                    ? selectedPanel.scripts.map((s) => (s.script_id === script.script_id ? script : s))
+                    : [...selectedPanel.scripts, script],
+                };
+                onInspectorChange(next);
               }}
             />
-            {validationErrors.length > 0 && (
-              <div className="banner error">
-                <strong>검증 실패</strong>
-                <ul>
-                  {validationErrors.map((err, idx) => (
-                    <li key={idx}>{err}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            <div className="form-actions">
-              <button type="button" onClick={() => void saveScript()}>저장 + 검증</button>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setEditingScriptId(null)}
-              >
-                취소
-              </button>
-            </div>
-          </div>
-        )}
-      </section>
+          ) : (
+            <div className="empty-row">왼쪽 패널을 클릭해 편집하세요.</div>
+          )}
+        </aside>
+      </div>
 
       <section className="panel">
         <div className="panel-head">
-          <span className="eyebrow">Indicator Instances</span>
-          <span className="count-pill">{instances.length}</span>
+          <span className="eyebrow">Indicator Errors</span>
+          <span className="count-pill">{errors.filter((e) => e.state === 'error').length}</span>
         </div>
-        {instances.length === 0 ? (
-          <div className="empty-row">활성화된 인디케이터 인스턴스가 없습니다.</div>
+        {errors.length === 0 ? (
+          <div className="empty-row">활성화된 인스턴스 오류 없음.</div>
         ) : (
           <div className="tbl-wrap">
             <table>
@@ -815,42 +1523,27 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
                   <th>instance</th>
                   <th>script</th>
                   <th>symbol</th>
-                  <th>params</th>
                   <th>state</th>
                   <th>output</th>
-                  <th />
                 </tr>
               </thead>
               <tbody>
-                {instances.map((inst) => {
-                  const err = errors.find((e) => e.instance_id === inst.instance_id);
-                  return (
-                    <tr key={inst.instance_id}>
-                      <td className="mono small">{inst.instance_id}</td>
-                      <td className="mono small">{inst.script_id}</td>
-                      <td>{inst.symbol || '*'}</td>
-                      <td className="mono small">{JSON.stringify(inst.params)}</td>
-                      <td>
-                        <span className={`badge ${err?.state === 'error' ? 'danger' : 'good'}`}>
-                          {err?.state ?? (inst.enabled ? 'running' : 'disabled')}
-                        </span>
-                        {err?.last_error && (
-                          <div className="sub mono small error-cell">{err.last_error.slice(0, 140)}</div>
-                        )}
-                      </td>
-                      <td>{err?.output_count ?? 0}</td>
-                      <td>
-                        <button
-                          type="button"
-                          className="sm-btn danger-sm"
-                          onClick={() => void deactivateInstance(inst.instance_id)}
-                        >
-                          해제
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
+                {errors.map((row) => (
+                  <tr key={row.instance_id}>
+                    <td className="mono small">{row.instance_id}</td>
+                    <td className="mono small">{row.script_id}</td>
+                    <td>{row.symbol || '*'}</td>
+                    <td>
+                      <span className={`badge ${row.state === 'error' ? 'danger' : 'good'}`}>
+                        {row.state}
+                      </span>
+                      {row.last_error && (
+                        <div className="sub mono small error-cell">{row.last_error.slice(0, 200)}</div>
+                      )}
+                    </td>
+                    <td>{row.output_count}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
