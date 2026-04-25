@@ -1,0 +1,46 @@
+{
+  "url": "http://127.0.0.1:51261/docs/prototypes/echarts-renderer-prototype.html",
+  "html": "docs/prototypes/echarts-renderer-prototype.html",
+  "screenshot": "docs/verification/echarts-renderer-prototype-2026-04-26/echarts-prototype.png",
+  "checks": {
+    "line": true,
+    "candle": true,
+    "overlay": true,
+    "tooltip": true,
+    "dataZoom": true,
+    "arbitraryPaths": true,
+    "resizeFullWidth": true,
+    "tenKFeasible": true
+  },
+  "metricsBeforeResize": {
+    "renderer": "echarts",
+    "rows": 10000,
+    "linePoints": 10000,
+    "candlePoints": 10000,
+    "overlaySeries": 2,
+    "arbitraryXPath": "rawPathCanMove.x",
+    "arbitraryYPath": "rawPathCanMove.y",
+    "tooltipEnabled": true,
+    "dataZoomEnabled": true,
+    "transformMs": 26.4,
+    "renderMs": 142.4,
+    "fullWidthClientWidth": 1386,
+    "resizeEvents": 1
+  },
+  "metricsAfterViewportResize": {
+    "renderer": "echarts",
+    "rows": 10000,
+    "linePoints": 10000,
+    "candlePoints": 10000,
+    "overlaySeries": 2,
+    "arbitraryXPath": "rawPathCanMove.x",
+    "arbitraryYPath": "rawPathCanMove.y",
+    "tooltipEnabled": true,
+    "dataZoomEnabled": true,
+    "transformMs": 26.4,
+    "renderMs": 142.4,
+    "fullWidthClientWidth": 926,
+    "resizeEvents": 3
+  },
+  "decision": "MIGRATE_TO_ECHARTS"
+}

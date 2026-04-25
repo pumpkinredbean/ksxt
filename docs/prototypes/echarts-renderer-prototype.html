@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ECharts renderer prototype — raw path model</title>
+  <style>
+    body { margin: 0; background: #111827; color: #e5e7eb; font-family: system-ui, sans-serif; }
+    main { padding: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap: 12px; }
+    .card { min-width: 0; background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 10px; }
+    .chart { width: 100%; height: 320px; }
+    #wide { width: 100%; height: 220px; margin-top: 12px; border: 1px solid #334155; }
+    pre { white-space: pre-wrap; font-size: 12px; color: #bfdbfe; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ECharts renderer prototype — raw path model</h1>
+    <p>Inspectable prototype for line, candle, and candle+line overlay using arbitrary dotted paths from raw event payloads.</p>
+    <div class="grid">
+      <section class="card"><h2>Line</h2><div id="line" class="chart"></div></section>
+      <section class="card"><h2>Candle</h2><div id="candle" class="chart"></div></section>
+      <section class="card"><h2>Candle + line overlay</h2><div id="overlay" class="chart"></div></section>
+    </div>
+    <section class="card"><h2>Full-width resize probe</h2><div id="wide"></div></section>
+    <pre id="metrics">loading…</pre>
+  </main>
+  <script src="/apps/admin_web/node_modules/echarts/dist/echarts.min.js"></script>
+  <script>
+    const POINTS = 10000;
+    const time0 = Date.UTC(2026, 0, 1, 0, 0, 0);
+
+    function rawRows(count) {
+      const out = [];
+      let close = 100;
+      for (let i = 0; i < count; i += 1) {
+        const open = close;
+        close = Math.max(1, open + Math.sin(i / 17) * 1.8 + Math.cos(i / 31) * 0.9);
+        const high = Math.max(open, close) + 0.6 + (i % 7) / 10;
+        const low = Math.min(open, close) - 0.6 - (i % 5) / 10;
+        out.push({
+          provider: 'binance',
+          event_name: 'ohlcv',
+          raw: {
+            info: { E: time0 + i * 60000, nested: { arbitrary: { y: close + Math.sin(i / 9) } } },
+            k: { t: time0 + i * 60000, o: open, h: high, l: low, c: close },
+          },
+          rawPathCanMove: { x: time0 + i * 60000, y: close * 1.01 },
+        });
+      }
+      return out;
+    }
+
+    function getByPath(obj, path) {
+      return String(path).split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj);
+    }
+
+    function toIso(ms) { return new Date(Number(ms)).toISOString(); }
+
+    function lineFromRaw(rows, xPath, yPath) {
+      return rows.map((row) => [toIso(getByPath(row, xPath)), Number(getByPath(row, yPath))])
+        .filter(([, y]) => Number.isFinite(y));
+    }
+
+    function candleFromRaw(rows, paths) {
+      return rows.map((row) => [
+        toIso(getByPath(row, paths.x)),
+        Number(getByPath(row, paths.open)),
+        Number(getByPath(row, paths.close)),
+        Number(getByPath(row, paths.low)),
+        Number(getByPath(row, paths.high)),
+      ]).filter((row) => row.slice(1).every(Number.isFinite));
+    }
+
+    function option(title, series) {
+      return {
+        animation: false,
+        title: { text: title, left: 8, textStyle: { color: '#e5e7eb', fontSize: 12 } },
+        backgroundColor: '#111827',
+        color: ['#38bdf8', '#f59e0b'],
+        tooltip: { trigger: 'axis' },
+        legend: { top: 24, textStyle: { color: '#cbd5e1' } },
+        grid: { top: 64, left: 48, right: 24, bottom: 54 },
+        dataZoom: [{ type: 'inside' }, { type: 'slider', height: 20 }],
+        xAxis: { type: 'time', axisLabel: { color: '#cbd5e1' } },
+        yAxis: { type: 'value', scale: true, axisLabel: { color: '#cbd5e1' }, splitLine: { lineStyle: { color: '#1f2937' } } },
+        series,
+      };
+    }
+
+    const rows = rawRows(POINTS);
+    const t0 = performance.now();
+    const lineData = lineFromRaw(rows, 'raw.info.E', 'raw.info.nested.arbitrary.y');
+    const movedLineData = lineFromRaw(rows, 'rawPathCanMove.x', 'rawPathCanMove.y');
+    const candleData = candleFromRaw(rows, { x: 'raw.k.t', open: 'raw.k.o', high: 'raw.k.h', low: 'raw.k.l', close: 'raw.k.c' });
+    const transformMs = performance.now() - t0;
+
+    const charts = {
+      line: echarts.init(document.getElementById('line')),
+      candle: echarts.init(document.getElementById('candle')),
+      overlay: echarts.init(document.getElementById('overlay')),
+      wide: echarts.init(document.getElementById('wide')),
+    };
+    const renderStart = performance.now();
+    charts.line.setOption(option('10k line from raw.info.* paths', [{ name: 'raw arbitrary y', type: 'line', showSymbol: false, data: lineData }]));
+    charts.candle.setOption(option('10k candle from raw.k.* paths', [{ name: 'ohlcv', type: 'candlestick', data: candleData }]));
+    charts.overlay.setOption(option('10k candle + moved arbitrary line', [
+      { name: 'ohlcv', type: 'candlestick', data: candleData },
+      { name: 'rawPathCanMove.y', type: 'line', showSymbol: false, data: movedLineData },
+    ]));
+    charts.wide.setOption(option('resize/full-width probe', [{ name: 'resized line', type: 'line', showSymbol: false, data: movedLineData }]));
+    const renderMs = performance.now() - renderStart;
+
+    const metrics = {
+      renderer: 'echarts',
+      rows: rows.length,
+      linePoints: lineData.length,
+      candlePoints: candleData.length,
+      overlaySeries: 2,
+      arbitraryXPath: 'rawPathCanMove.x',
+      arbitraryYPath: 'rawPathCanMove.y',
+      tooltipEnabled: true,
+      dataZoomEnabled: true,
+      transformMs: Number(transformMs.toFixed(2)),
+      renderMs: Number(renderMs.toFixed(2)),
+      fullWidthClientWidth: document.getElementById('wide').clientWidth,
+      resizeEvents: 0,
+    };
+    function recordResize() {
+      metrics.resizeEvents += 1;
+      Object.values(charts).forEach((chart) => chart.resize());
+      metrics.fullWidthClientWidth = document.getElementById('wide').clientWidth;
+      document.getElementById('metrics').textContent = JSON.stringify(metrics, null, 2);
+    }
+    const ro = new ResizeObserver(recordResize);
+    ro.observe(document.body);
+    window.addEventListener('resize', recordResize);
+
+    window.__ECHARTS_PROTOTYPE__ = { metrics, rows, lineData, candleData, movedLineData };
+    document.getElementById('metrics').textContent = JSON.stringify(metrics, null, 2);
+  </script>
+</body>
+</html>
