@@ -223,6 +223,18 @@ def _instrument_ref_to_dict(instrument: Any) -> dict[str, Any] | None:
     }
 
 
+def _event_instrument_ref(event: Any) -> Any:
+    """Return event.instrument, or synthesize it from KXT's symbol-only event DTOs."""
+
+    instrument = getattr(event, "instrument", None)
+    if instrument is not None:
+        return instrument
+    symbol = getattr(event, "symbol", None)
+    if not symbol:
+        return None
+    return KSXTInstrumentRef(symbol=str(symbol), venue=KSXTVenue.KRX)
+
+
 def _isoformat_utc(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
@@ -233,7 +245,7 @@ def _kxt_trade_event_dto_payload(event: KSXTTradeEvent | KSXTTrade) -> dict[str,
     """KXT TradeEvent/Trade serialized using KXT DTO field names (no Korean keys)."""
 
     payload: dict[str, Any] = {
-        "instrument": _instrument_ref_to_dict(getattr(event, "instrument", None)),
+        "instrument": _instrument_ref_to_dict(_event_instrument_ref(event)),
         "occurred_at": _isoformat_utc(event.occurred_at),
         "price": _number(getattr(event, "price", None)),
         "quantity": _number(getattr(event, "quantity", None)),
@@ -268,7 +280,7 @@ def _kxt_order_book_event_dto_payload(
         for level in getattr(event, "bids", ()) or ()
     ]
     return {
-        "instrument": _instrument_ref_to_dict(getattr(event, "instrument", None)),
+        "instrument": _instrument_ref_to_dict(_event_instrument_ref(event)),
         "occurred_at": _isoformat_utc(event.occurred_at),
         "asks": asks,
         "bids": bids,

@@ -455,16 +455,12 @@ class SubscribeAckTimeoutWatchdogTests(unittest.IsolatedAsyncioTestCase):
                 yield  # pragma: no cover
 
             # Target B: events() yields one KSXTTradeEvent then parks.
-            from kxt import (
-                InstrumentRef as KSXTInstrumentRef,
-                TradeEvent as KSXTTradeEvent,
-                Venue as KSXTVenue,
-            )
+            from kxt import TradeEvent as KSXTTradeEvent
 
             async def _healthy_stream():
                 trade = KSXTTradeEvent(
-                    instrument=KSXTInstrumentRef(symbol="005930", venue=KSXTVenue.KRX),
                     occurred_at=datetime.now(timezone.utc),
+                    symbol="005930",
                     price=Decimal("70000"),
                     quantity=Decimal("1"),
                     side="buy",
@@ -597,7 +593,7 @@ class KxtDtoSerializerTests(unittest.TestCase):
         occurred = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
         event = KSXTTradeEvent(
             occurred_at=occurred,
-            instrument=self._make_instrument(),
+            symbol="005930",
             price=Decimal("71000"),
             quantity=Decimal("10"),
             side=None,
@@ -627,7 +623,7 @@ class KxtDtoSerializerTests(unittest.TestCase):
         occurred = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
         event = KSXTOrderBookEvent(
             occurred_at=occurred,
-            instrument=self._make_instrument(),
+            symbol="005930",
             asks=(
                 QuoteLevel(price=Decimal("71100"), quantity=Decimal("5")),
                 QuoteLevel(price=Decimal("71200"), quantity=Decimal("7")),
