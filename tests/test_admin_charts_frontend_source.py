@@ -83,6 +83,18 @@ def test_chart_time_extraction_supports_selected_field_and_fallbacks() -> None:
     assert "extractChartTime(r, timeField)" in source
 
 
+def test_production_chart_renderer_uses_echarts_not_lightweight_charts() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "from 'lightweight-charts'" not in source
+    assert "createChart" not in source
+    assert "echarts.init" in source
+    assert "type: 'candlestick'" in source
+    assert "type: 'line'" in source
+    assert "tooltip: { trigger: 'axis'" in source
+    assert "dataZoom:" in source
+
+
 def test_charts_grid_is_not_shrunk_by_inspector_column() -> None:
     css = STYLES.read_text()
     source = CHARTS_VIEW.read_text()

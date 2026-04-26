@@ -1,0 +1,116 @@
+{
+  "target": "http://127.0.0.1:8000/admin/charts",
+  "asset": "/admin/assets/index-D6zx0fwV.js",
+  "screenshot": "docs/verification/admin-charts-e2e-latest/admin-charts-e2e.png",
+  "checks": {
+    "currentBuiltAsset": true,
+    "targetlessDisabled": true,
+    "targetEventXYFlow": true,
+    "saveReloadRetained": true,
+    "canvasRendered": true,
+    "echartsRendererActive": true,
+    "candlePanelRendered": true,
+    "candleOverlayLineRendered": true,
+    "tooltipConfigured": true,
+    "dataZoomConfigured": true,
+    "seriesSampleCount": 24,
+    "fullWidthTinyRegressionAbsent": true,
+    "normalizedOptionCount": 0
+  },
+  "panelState": [
+    {
+      "panel_id": "panel-e2e-line-0",
+      "chart_type": "line",
+      "symbol": "BTCUSDT",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 14,
+      "title": "Line",
+      "notes": null,
+      "scripts": [],
+      "instances": [],
+      "series_bindings": [
+        {
+          "binding_id": "bind-zwp6jm94",
+          "indicator_ref": "builtin.raw",
+          "instance_id": "",
+          "input_bindings": [
+            {
+              "slot_name": "source",
+              "target_id": "binance-spot-BTCUSDT",
+              "event_name": "trade",
+              "time_field_name": "raw.info.E",
+              "field_name": "raw.price"
+            }
+          ],
+          "param_values": [
+            [
+              "field",
+              "raw.price"
+            ],
+            [
+              "time_field",
+              "raw.info.E"
+            ]
+          ],
+          "output_name": "value",
+          "axis": "left",
+          "color": "",
+          "label": "raw.price",
+          "visible": true
+        }
+      ],
+      "base_feed": null
+    },
+    {
+      "panel_id": "panel-e2e-candle-1",
+      "chart_type": "candle",
+      "symbol": "BTCUSDT",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 14,
+      "title": "Candle",
+      "notes": null,
+      "base_feed": {
+        "target_id": "binance-spot-BTCUSDT",
+        "event_name": "ohlcv",
+        "time_field_name": "raw.info.t"
+      },
+      "scripts": [],
+      "instances": [],
+      "series_bindings": [
+        {
+          "binding_id": "bind-p1312ti1",
+          "indicator_ref": "builtin.raw",
+          "instance_id": "",
+          "input_bindings": [
+            {
+              "slot_name": "source",
+              "target_id": "binance-spot-BTCUSDT",
+              "event_name": "trade",
+              "time_field_name": "raw.info.E",
+              "field_name": "raw.price"
+            }
+          ],
+          "param_values": [
+            [
+              "field",
+              "raw.price"
+            ],
+            [
+              "time_field",
+              "raw.info.E"
+            ]
+          ],
+          "output_name": "value",
+          "axis": "left",
+          "color": "",
+          "label": "overlay raw.price",
+          "visible": true
+        }
+      ]
+    }
+  ]
+}

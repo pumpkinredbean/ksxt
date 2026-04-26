@@ -1,14 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import GridLayout, { Layout, WidthProvider } from 'react-grid-layout';
 import Editor from '@monaco-editor/react';
-import {
-  createChart,
-  IChartApi,
-  ISeriesApi,
-  LineData,
-  CandlestickData,
-  UTCTimestamp,
-} from 'lightweight-charts';
+import * as echarts from 'echarts';
+import type { EChartsOption, EChartsType, SeriesOption } from 'echarts';
 
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
@@ -146,6 +140,10 @@ interface AdminRecentEventRow {
   matched_target_ids?: string[];
   payload?: Record<string, unknown> | null;
 }
+
+type UTCTimestamp = number;
+type EChartLinePoint = [number, number];
+type EChartCandlePoint = [number, number, number, number, number];
 
 // ─── LocalStorage keys ───────────────────────────────────────────────────
 
@@ -344,7 +342,7 @@ export function parseChartTime(raw: unknown): UTCTimestamp | null {
     ms = new Date(String(raw)).getTime();
   }
   if (!Number.isFinite(ms)) return null;
-  return Math.floor(ms / 1000) as UTCTimestamp;
+  return Math.floor(ms / 1000);
 }
 
 export function extractChartTime(row: Record<string, unknown>, timeFieldName?: string): UTCTimestamp | null {
@@ -409,6 +407,25 @@ function syncRawFieldParam(binding: ChartSeriesBinding, slots: ChartInputBinding
 
 function isFieldParamHidden(binding: ChartSeriesBinding, paramName: string): boolean {
   return binding.indicator_ref === 'builtin.raw' && (paramName === 'field' || paramName === 'time_field');
+}
+
+function chartTimeToMs(ts: UTCTimestamp): number {
+  return ts * 1000;
+}
+
+function finiteNumber(raw: unknown): number | null {
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function extractOhlc(payload: Record<string, unknown>): { open: number; high: number; low: number; close: number } | null {
+  const raw = payload.raw;
+  const open = finiteNumber(valueAtPath(payload, 'open') ?? valueAtPath(payload, 'raw.open') ?? (Array.isArray(raw) ? raw[1] : null));
+  const high = finiteNumber(valueAtPath(payload, 'high') ?? valueAtPath(payload, 'raw.high') ?? (Array.isArray(raw) ? raw[2] : null));
+  const low = finiteNumber(valueAtPath(payload, 'low') ?? valueAtPath(payload, 'raw.low') ?? (Array.isArray(raw) ? raw[3] : null));
+  const close = finiteNumber(valueAtPath(payload, 'close') ?? valueAtPath(payload, 'raw.close') ?? (Array.isArray(raw) ? raw[4] : null));
+  if (open == null || high == null || low == null || close == null) return null;
+  return { open, high, low, close };
 }
 
 // ─── Selector helpers (target-aware events + observed raw sample fields) ──
@@ -596,97 +613,59 @@ function ChartPanel({
   rawEvents: Map<string, Array<Record<string, unknown>>>;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const chartRef = useRef<IChartApi | null>(null);
-  const baseSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const seriesRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map());
+  const chartRef = useRef<EChartsType | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
-    const chart = createChart(containerRef.current, {
-      layout: { background: { color: '#1a1a1a' }, textColor: '#d0d0d0' },
-      grid: { vertLines: { color: '#262626' }, horzLines: { color: '#262626' } },
-      timeScale: { timeVisible: true, secondsVisible: true },
-      rightPriceScale: { visible: true },
-      leftPriceScale: { visible: true },
-      autoSize: true,
-    });
+    const chart = echarts.init(containerRef.current, 'dark', { renderer: 'canvas' });
     chartRef.current = chart;
-    // ResizeObserver on the host to trigger chart.resize defensively.
+    // ResizeObserver on the host to trigger ECharts resize defensively.
     const ro = new ResizeObserver(() => {
       if (!containerRef.current || !chartRef.current) return;
       const { width, height } = containerRef.current.getBoundingClientRect();
-      if (width > 0 && height > 0) chartRef.current.resize(width, height);
+      if (width > 0 && height > 0) chartRef.current.resize({ width, height });
     });
     ro.observe(containerRef.current);
     return () => {
       ro.disconnect();
-      chart.remove();
+      chart.dispose();
       chartRef.current = null;
-      baseSeriesRef.current = null;
-      seriesRef.current = new Map();
     };
   }, []);
 
-  // Render base feed (candle).
+  // Render all production chart content with ECharts.
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
+    const series: SeriesOption[] = [];
     if (spec.chart_type === 'candle' && spec.base_feed?.target_id) {
-      if (!baseSeriesRef.current) {
-        baseSeriesRef.current = chart.addCandlestickSeries();
-      }
       const key = `${spec.base_feed.target_id}:${spec.base_feed.event_name || 'ohlcv'}`;
       const rows = rawEvents.get(key) ?? [];
       const data = rows
-        .map((r): CandlestickData | null => {
+        .map((r): EChartCandlePoint | null => {
           const ts = extractChartTime(r, spec.base_feed?.time_field_name);
           if (!ts) return null;
-          return {
-            time: ts,
-            open: Number((r as any).open),
-            high: Number((r as any).high),
-            low: Number((r as any).low),
-            close: Number((r as any).close),
-          };
+          const payload = ((r as any).__payload ?? r) as Record<string, unknown>;
+          const ohlc = extractOhlc(payload);
+          if (!ohlc) return null;
+          return [chartTimeToMs(ts), ohlc.open, ohlc.close, ohlc.low, ohlc.high];
         })
-        .filter((d): d is CandlestickData => d != null && Number.isFinite(d.open) && Number.isFinite(d.close))
-        .sort((a, b) => (a.time as number) - (b.time as number));
-      baseSeriesRef.current.setData(data);
-    } else if (baseSeriesRef.current) {
-      try { chart.removeSeries(baseSeriesRef.current); } catch { /* ignore */ }
-      baseSeriesRef.current = null;
+        .filter((d): d is EChartCandlePoint => d != null)
+        .sort((a, b) => a[0] - b[0]);
+      series.push({
+        id: 'base-candle',
+        name: 'OHLCV',
+        type: 'candlestick',
+        data,
+        itemStyle: { color: '#22c55e', color0: '#ef4444', borderColor: '#22c55e', borderColor0: '#ef4444' },
+      });
     }
-  }, [spec.chart_type, spec.base_feed?.target_id, spec.base_feed?.event_name, spec.base_feed?.time_field_name, rawEvents]);
-
-  // Render line bindings.
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart) return;
-    const current = seriesRef.current;
-    const desired = new Set<string>();
 
     spec.series_bindings.forEach((binding, idx) => {
       if (!binding.visible) return;
-      desired.add(binding.binding_id);
-      let api = current.get(binding.binding_id);
       const color = binding.color || DEFAULT_COLORS[idx % DEFAULT_COLORS.length];
-      if (!api) {
-        api = chart.addLineSeries({
-          color,
-          lineWidth: 2,
-          priceScaleId: binding.axis === 'right' ? 'right' : 'left',
-        });
-        current.set(binding.binding_id, api);
-      } else {
-        try {
-          api.applyOptions({
-            color,
-            priceScaleId: binding.axis === 'right' ? 'right' : 'left',
-          });
-        } catch { /* ignore */ }
-      }
 
-      let data: LineData[] = [];
+      let data: EChartLinePoint[] = [];
       if (binding.indicator_ref === 'builtin.raw') {
         // Pull from raw stream using the source slot.
         const slot = binding.input_bindings.find((s) => s.slot_name === 'source')
@@ -702,39 +681,63 @@ function ChartPanel({
               const payload = ((r as any).__payload ?? r) as Record<string, unknown>;
               const value = extractScalar(payload, field);
               if (value == null || !ts) return null;
-              return {
-                time: ts,
-                value,
-              } as LineData;
+              return [chartTimeToMs(ts), value] as EChartLinePoint;
             })
-            .filter((d): d is LineData => d != null)
-            .sort((a, b) => (a.time as number) - (b.time as number));
+            .filter((d): d is EChartLinePoint => d != null)
+            .sort((a, b) => a[0] - b[0]);
         }
       } else if (binding.instance_id) {
         // Indicator output stream.
         const pts = indicatorOutputs.get(binding.instance_id) ?? [];
         data = pts
           .map((p) => ({
-            time: Math.floor(new Date(p.timestamp).getTime() / 1000) as UTCTimestamp,
+            time: new Date(p.timestamp).getTime(),
             value: p.value,
           }))
-          .sort((a, b) => (a.time as number) - (b.time as number));
+          .filter((p) => Number.isFinite(p.time) && Number.isFinite(p.value))
+          .map((p) => [p.time, p.value] as EChartLinePoint)
+          .sort((a, b) => a[0] - b[0]);
       }
-      api.setData(data);
+      series.push({
+        id: binding.binding_id,
+        name: binding.label || binding.indicator_ref || 'series',
+        type: 'line',
+        data,
+        showSymbol: false,
+        smooth: false,
+        yAxisIndex: binding.axis === 'right' ? 1 : 0,
+        lineStyle: { color, width: 2 },
+        itemStyle: { color },
+      });
     });
 
-    // Remove stale.
-    for (const [id, api] of Array.from(current.entries())) {
-      if (!desired.has(id)) {
-        try { chart.removeSeries(api); } catch { /* ignore */ }
-        current.delete(id);
-      }
+    const option: EChartsOption = {
+      backgroundColor: '#1a1a1a',
+      animation: false,
+      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+      grid: { left: 52, right: 52, top: 16, bottom: 48, containLabel: true },
+      xAxis: { type: 'time', axisLine: { lineStyle: { color: '#475569' } }, splitLine: { lineStyle: { color: '#262626' } } },
+      yAxis: [
+        { type: 'value', scale: true, position: 'left', axisLine: { show: true, lineStyle: { color: '#64748b' } }, splitLine: { lineStyle: { color: '#262626' } } },
+        { type: 'value', scale: true, position: 'right', axisLine: { show: true, lineStyle: { color: '#64748b' } }, splitLine: { show: false } },
+      ],
+      dataZoom: [
+        { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
+        { type: 'slider', xAxisIndex: 0, height: 22, bottom: 12, filterMode: 'none' },
+      ],
+      series,
+    };
+    chart.setOption(option, { notMerge: true, lazyUpdate: false });
+    if (containerRef.current) {
+      containerRef.current.dataset.tooltip = 'axis';
+      containerRef.current.dataset.dataZoom = 'inside,slider';
+      containerRef.current.dataset.seriesCount = String(series.length);
     }
-  }, [spec.series_bindings, indicatorOutputs, rawEvents]);
+  }, [spec.chart_type, spec.base_feed?.target_id, spec.base_feed?.event_name, spec.base_feed?.time_field_name, spec.series_bindings, indicatorOutputs, rawEvents]);
 
   return (
     <>
-      <div className="chart-host" ref={containerRef} />
+      <div className="chart-host" data-renderer="echarts" ref={containerRef} />
       {spec.series_bindings.length > 0 && (
         <div className="chart-legend">
           {spec.series_bindings
