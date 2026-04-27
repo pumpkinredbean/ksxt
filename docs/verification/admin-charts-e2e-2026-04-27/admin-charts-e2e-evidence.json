@@ -1,0 +1,158 @@
+{
+  "target": "http://127.0.0.1:8000/admin/charts",
+  "asset": "/admin/assets/index-CAOgUQY4.js",
+  "screenshot": "docs/verification/admin-charts-e2e-2026-04-27/admin-charts-e2e.png",
+  "checks": {
+    "currentBuiltAsset": true,
+    "targetlessDisabled": true,
+    "targetEventXYFlow": true,
+    "eventDropdownIncludesTargetEvents": true,
+    "indicatorDeclDidNotFilterEvents": true,
+    "tradeXYListsIdentical": true,
+    "orderBookXYListsIdentical": true,
+    "ohlcvXYListsIdentical": true,
+    "tradeRawPathsPresent": true,
+    "orderBookArrayPathsPresent": true,
+    "ohlcvArrayPathsPresent": true,
+    "saveReloadRetained": true,
+    "canvasRendered": true,
+    "echartsRendererActive": true,
+    "candlePanelRendered": true,
+    "candleOverlayLineRendered": true,
+    "tooltipConfigured": true,
+    "dataZoomConfigured": true,
+    "chartRenderOrZeroWarningVisible": true,
+    "seriesSampleCount": 24,
+    "fullWidthTinyRegressionAbsent": true,
+    "normalizedOptionCount": 0,
+    "scopedEventFetches": [
+      "http://127.0.0.1:8000/api/admin/events/stream?limit=1",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=order_book_snapshot&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=order_book_snapshot&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=order_book_snapshot&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events/stream?limit=1",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=trade&limit=50",
+      "http://127.0.0.1:8000/api/admin/events?target_id=binance-spot-BTCUSDT&event_name=ohlcv&limit=50"
+    ]
+  },
+  "panelState": [
+    {
+      "panel_id": "panel-e2e-line-0",
+      "chart_type": "line",
+      "symbol": "BTCUSDT",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 14,
+      "title": "Line",
+      "notes": null,
+      "scripts": [],
+      "instances": [],
+      "series_bindings": [
+        {
+          "binding_id": "bind-hsjlw9q5",
+          "indicator_ref": "builtin.raw",
+          "instance_id": "",
+          "input_bindings": [
+            {
+              "slot_name": "source",
+              "target_id": "binance-spot-BTCUSDT",
+              "event_name": "trade",
+              "time_field_name": "raw.info.E",
+              "field_name": "raw.price"
+            }
+          ],
+          "param_values": [
+            [
+              "field",
+              "raw.price"
+            ],
+            [
+              "time_field",
+              "raw.info.E"
+            ]
+          ],
+          "output_name": "value",
+          "axis": "left",
+          "color": "",
+          "label": "raw.price",
+          "visible": true
+        }
+      ],
+      "base_feed": null
+    },
+    {
+      "panel_id": "panel-e2e-candle-1",
+      "chart_type": "candle",
+      "symbol": "BTCUSDT",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 14,
+      "title": "Candle",
+      "notes": null,
+      "base_feed": {
+        "target_id": "binance-spot-BTCUSDT",
+        "event_name": "ohlcv",
+        "time_field_name": "raw[0]"
+      },
+      "scripts": [],
+      "instances": [],
+      "series_bindings": [
+        {
+          "binding_id": "bind-8kvhdfv6",
+          "indicator_ref": "builtin.raw",
+          "instance_id": "",
+          "input_bindings": [
+            {
+              "slot_name": "source",
+              "target_id": "binance-spot-BTCUSDT",
+              "event_name": "trade",
+              "time_field_name": "raw.info.E",
+              "field_name": "raw.price"
+            }
+          ],
+          "param_values": [
+            [
+              "field",
+              "raw.price"
+            ],
+            [
+              "time_field",
+              "raw.info.E"
+            ]
+          ],
+          "output_name": "value",
+          "axis": "left",
+          "color": "",
+          "label": "overlay raw.price",
+          "visible": true
+        }
+      ]
+    }
+  ]
+}

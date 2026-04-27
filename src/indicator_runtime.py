@@ -117,14 +117,17 @@ class RawPassthroughIndicator(HubIndicator):
     """
 
     name = "Raw"
-    inputs: tuple[str, ...] = ("ohlcv", "trade", "mark_price", "funding_rate")
+    inputs: tuple[str, ...] = ()
     output_kind = "line"
 
     DEFAULT_FIELDS: dict[str, str] = {
         "ohlcv": "close",
         "trade": "price",
+        "ticker": "last",
         "mark_price": "value",
         "funding_rate": "rate",
+        "open_interest": "open_interest",
+        "program_trade": "amount",
     }
 
     @staticmethod
@@ -134,10 +137,13 @@ class RawPassthroughIndicator(HubIndicator):
         if field in payload:
             return payload[field]
         cur: Any = payload
-        for part in field.split("."):
-            if not part:
-                return None
-            if isinstance(cur, dict) and part in cur:
+        for part in _path_tokens(field):
+            if isinstance(part, int):
+                if isinstance(cur, (list, tuple)) and part < len(cur):
+                    cur = cur[part]
+                else:
+                    return None
+            elif isinstance(cur, dict) and part in cur:
                 cur = cur[part]
             else:
                 return None
@@ -184,7 +190,16 @@ _RAW_PASSTHROUGH_DECLARATION = IndicatorDeclaration(
     inputs=(
         IndicatorInputDecl(
             slot_name="source",
-            event_names=("ohlcv", "trade", "mark_price", "funding_rate"),
+            event_names=(
+                "trade",
+                "order_book_snapshot",
+                "ticker",
+                "ohlcv",
+                "mark_price",
+                "funding_rate",
+                "open_interest",
+                "program_trade",
+            ),
             field_hints=(
                 "close", "open", "high", "low", "volume",
                 "price", "value", "rate", "mark_price",
@@ -213,6 +228,34 @@ _RAW_PASSTHROUGH_DECLARATION = IndicatorDeclaration(
         IndicatorOutputDecl(name="value", kind="line", label="value", is_primary=True),
     ),
 )
+
+
+def _path_tokens(field_name: str) -> list[str | int]:
+    tokens: list[str | int] = []
+    i = 0
+    while i < len(field_name):
+        if field_name[i] == ".":
+            i += 1
+            continue
+        if field_name[i] == "[":
+            end = field_name.find("]", i)
+            if end < 0:
+                return []
+            raw_index = field_name[i + 1:end]
+            if not raw_index.isdigit():
+                return []
+            tokens.append(int(raw_index))
+            i = end + 1
+            continue
+        j = i
+        while j < len(field_name) and field_name[j] not in ".[":
+            j += 1
+        key = field_name[i:j]
+        if not key:
+            return []
+        tokens.append(key)
+        i = j
+    return tokens
 
 
 _OBI_DECLARATION = IndicatorDeclaration(

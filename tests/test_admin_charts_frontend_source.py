@@ -27,24 +27,26 @@ def test_raw_binding_uses_slot_field_before_param_field_and_syncs_param() -> Non
     assert "time_field: source?.time_field_name" in source
 
 
-def test_time_field_candidates_are_separate_from_value_fields() -> None:
+def test_x_and_y_candidates_share_single_raw_path_catalog() -> None:
     source = CHARTS_VIEW.read_text()
 
+    assert "export function computeRawPathCatalog" in source
     assert "computeAllowedTimeFields" in source
-    assert "TIME_FIELD_PRIORITY" in source
-    assert "'raw.info.E', 'raw.info.T', 'raw.info.t'" in source
-    assert "price" not in source[source.index("const TIME_FIELD_PRIORITY"):source.index("function isTimeLikePath")]
-    assert "x/time field" in source
-    assert "y/value field" in source
+    assert "return computeRawPathCatalog(eventName, target, rawEvents);" in source
+    assert "const timeFieldRes = computeRawPathCatalog(slot.event_name, slotTarget, rawEvents);" in source
+    assert "const fieldRes = computeAllowedFields(" in source
+    assert "x raw path" in source
+    assert "y raw path" in source
     assert "disabled={!slotTarget || !slot.event_name || timeFields.length === 0}" in source
-    assert "normalized." not in source[source.index("const TIME_FIELD_PRIORITY"):source.index("function isTimeLikePath")]
+    assert "TIME_FIELD_PRIORITY" not in source
+    assert "function isTimeLikePath" not in source
 
 
 def test_normalized_candidates_are_filtered_from_value_fields() -> None:
     source = CHARTS_VIEW.read_text()
 
-    assert "!f.startsWith('normalized.')" in source
-    assert "if (top === 'normalized') continue;" in source
+    assert "current.startsWith('normalized.')" in source
+    assert "k === 'normalized'" in source
 
 
 def test_normalize_panel_scrubs_legacy_normalized_bindings() -> None:
@@ -117,7 +119,7 @@ def test_raw_event_target_mirror_updates_existing_keys() -> None:
 def test_selectors_use_actual_target_event_samples_only() -> None:
     source = CHARTS_VIEW.read_text()
 
-    helper_start = source.index("export function computeAllowedFields")
+    helper_start = source.index("export function computeRawPathCatalog")
     helper_end = source.index("export function rawEventMirrorKeysForPanels")
     helper = source[helper_start:helper_end]
     assert "canonicalSchemas" not in helper
@@ -126,3 +128,34 @@ def test_selectors_use_actual_target_event_samples_only() -> None:
     assert "sampleOptionLabel" in source
     assert "— sample unavailable —" in source
     assert "newAllowedEvents[0]" not in source
+
+
+def test_event_options_ignore_indicator_event_names_and_warn_only() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    helper_start = source.index("export function computeAllowedEvents")
+    helper_end = source.index("export type FieldOptionLayer")
+    helper = source[helper_start:helper_end]
+    assert "_slotEventNames" in helper
+    assert "slotEventNames" not in helper.replace("_slotEventNames", "")
+    assert "target.event_types" in helper
+    assert "supported_event_types" in helper
+    assert "showCompatibilityWarning" in source
+    assert "binding.indicator_ref !== 'builtin.raw'" in source
+
+
+def test_selected_target_event_fetches_scoped_raw_samples() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "selectedSamplePairs(panels)" in source
+    assert "/api/admin/events?target_id=${encodeURIComponent(pair.targetId)}&event_name=${encodeURIComponent(pair.eventName)}&limit=50" in source
+    assert "/api/admin/events?limit=200" not in source
+
+
+def test_raw_paths_and_reader_support_bracket_syntax() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "function pathTokens" in source
+    assert "tokens.push(n)" in source
+    assert "Array.isArray(cur) && part < cur.length" in source
+    assert "`${prefix}[${i}]`" in source

@@ -23,28 +23,53 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     state = {"panels": []}
+    event_request_urls = []
     now = "2026-04-26T00:00:00.000Z"
-    samples = []
-    ohlcv_samples = []
+    samples_by_event = {"trade": [], "order_book_snapshot": [], "ticker": [], "ohlcv": []}
     for i in range(24):
-        samples.append({
+        samples_by_event["trade"].append({
             "event_name": "trade",
             "symbol": "BTCUSDT",
             "published_at": now,
             "matched_target_ids": [TARGET_ID],
             "payload": {
-                "raw": {"info": {"E": 1766620800000 + i * 1000}, "price": 70000 + i, "qty": 0.1 + i / 100},
+                "raw": {
+                    "price": 70000 + i,
+                    "amount": 0.1 + i / 100,
+                    "info": {"E": 1766620800000 + i * 1000, "p": str(70000 + i), "q": str(0.1 + i / 100)},
+                },
                 "price": 70000 + i,
                 "occurred_at": f"2026-04-26T00:00:{i:02d}.000Z",
             },
         })
-        ohlcv_samples.append({
+        samples_by_event["order_book_snapshot"].append({
+            "event_name": "order_book_snapshot",
+            "symbol": "BTCUSDT",
+            "published_at": now,
+            "matched_target_ids": [TARGET_ID],
+            "payload": {
+                "raw": {
+                    "bids": [[70000 + i, 1.0 + i / 10]],
+                    "asks": [[70010 + i, 1.5 + i / 10]],
+                    "info": {"E": 1766620800000 + i * 1000},
+                },
+                "occurred_at": f"2026-04-26T00:00:{i:02d}.000Z",
+            },
+        })
+        samples_by_event["ticker"].append({
+            "event_name": "ticker",
+            "symbol": "BTCUSDT",
+            "published_at": now,
+            "matched_target_ids": [TARGET_ID],
+            "payload": {"raw": {"last": 70000 + i, "info": {"E": 1766620800000 + i * 1000}}, "occurred_at": f"2026-04-26T00:00:{i:02d}.000Z"},
+        })
+        samples_by_event["ohlcv"].append({
             "event_name": "ohlcv",
             "symbol": "BTCUSDT",
             "published_at": now,
             "matched_target_ids": [TARGET_ID],
             "payload": {
-                "raw": {"info": {"t": 1766620800000 + i * 60_000}},
+                "raw": [1766620800000 + i * 60_000, 70000 + i, 70010 + i, 69990 + i, 70005 + i, 10 + i],
                 "open": 70000 + i,
                 "high": 70010 + i,
                 "low": 69990 + i,
@@ -75,11 +100,14 @@ def main() -> None:
             route.fulfill(json={
                 "collector_offline": False,
                 "container_status": "running",
-                "source_capabilities": [{"provider": "binance", "venue": "spot", "instrument_type": "spot", "supported_event_types": ["trade", "ohlcv"], "label": "Binance Spot"}],
-                "collection_targets": [{"target_id": TARGET_ID, "instrument": {"symbol": "BTCUSDT", "instrument_type": "spot", "venue": "spot"}, "provider": "binance", "event_types": ["trade", "ohlcv"], "enabled": True}],
+                "source_capabilities": [{"provider": "binance", "venue": "spot", "instrument_type": "spot", "supported_event_types": ["trade", "order_book_snapshot", "ticker", "ohlcv"], "label": "Binance Spot"}],
+                "collection_targets": [{"target_id": TARGET_ID, "instrument": {"symbol": "BTCUSDT", "instrument_type": "spot", "venue": "spot"}, "provider": "binance", "event_types": ["trade", "order_book_snapshot", "ticker", "ohlcv"], "enabled": True}],
             })
-        elif url.endswith("/api/admin/events?limit=200") or "/api/admin/events" in url:
-            route.fulfill(json={"recent_events": samples + ohlcv_samples})
+        elif "/api/admin/events" in url:
+            event_request_urls.append(url)
+            event_name = re.search(r"[?&]event_name=([^&]+)", url)
+            name = event_name.group(1) if event_name else ""
+            route.fulfill(json={"recent_events": samples_by_event.get(name, [])})
         elif url.endswith("/api/admin/charts/panels") and req.method == "GET":
             route.fulfill(json={"panels": state["panels"]})
         elif url.endswith("/api/admin/charts/panels") and req.method == "PUT":
@@ -114,23 +142,40 @@ def main() -> None:
         line_binding = page.locator(".binding-row").last
         line_selects = line_binding.locator("select")
         line_selects.nth(1).select_option(TARGET_ID)
+        event_options = line_selects.nth(2).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
         line_selects.nth(2).select_option("trade")
+        page.wait_for_function("() => Array.from(document.querySelectorAll('select')).some(s => Array.from(s.options).some(o => o.value === 'raw.info.p'))")
+        trade_x_options = line_selects.nth(3).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+        trade_y_options = line_selects.nth(4).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
         line_selects.nth(3).select_option("raw.info.E")
         line_selects.nth(4).select_option("raw.price")
         page.get_by_role("textbox", name="Label", exact=True).fill("raw.price")
         page.wait_for_timeout(700)
         expect(page.locator(".chart-legend")).to_contain_text("raw.price")
+        line_selects.nth(2).select_option("order_book_snapshot")
+        page.wait_for_function("() => Array.from(document.querySelectorAll('select option')).some(o => o.value === 'raw.bids[0][0]')")
+        ob_x_options = line_selects.nth(3).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+        ob_y_options = line_selects.nth(4).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+        line_selects.nth(3).select_option("raw.bids[0][0]")
+        line_selects.nth(4).select_option("raw.bids[0][1]")
+        line_selects.nth(2).select_option("ohlcv")
+        page.wait_for_function("() => Array.from(document.querySelectorAll('select option')).some(o => o.value === 'raw[4]')")
+        ohlcv_x_options = line_selects.nth(3).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+        ohlcv_y_options = line_selects.nth(4).locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+        line_selects.nth(3).select_option("raw[0]")
+        line_selects.nth(4).select_option("raw[4]")
         page.reload(wait_until="networkidle")
         expect(page.locator(".chart-legend")).to_contain_text("raw.price")
         page.get_by_role("button", name=re.compile(r"Candle")).click()
         expect(page.locator(".chart-wrapper")).to_have_count(2)
         page.locator(".chart-wrapper").nth(1).click()
-        page.locator("label.field").filter(has_text=re.compile("x/time field")).first.locator("select").select_option("raw.info.t")
+        page.locator("label.field").filter(has_text=re.compile("x raw path")).first.locator("select").select_option("raw[0]")
         page.locator(".inspector-section").filter(has_text=re.compile("Overlays")).get_by_role("button", name=re.compile("추가")).click()
         overlay_binding = page.locator(".binding-row").last
         overlay_selects = overlay_binding.locator("select")
         overlay_selects.nth(1).select_option(TARGET_ID)
         overlay_selects.nth(2).select_option("trade")
+        page.wait_for_function("() => Array.from(document.querySelectorAll('select option')).some(o => o.value === 'raw.price')")
         overlay_selects.nth(3).select_option("raw.info.E")
         overlay_selects.nth(4).select_option("raw.price")
         page.get_by_role("textbox", name="Label", exact=True).last.fill("overlay raw.price")
@@ -142,6 +187,7 @@ def main() -> None:
         chart_box = page.locator(".chart-host").first.bounding_box()
         wrapper_box = page.locator(".chart-wrapper").first.bounding_box()
         normalized_options = page.locator('select option[value^="normalized."]').count()
+        warning_count = page.locator(".chart-warning").count()
         screenshot = out / "admin-charts-e2e.png"
         page.screenshot(path=str(screenshot), full_page=True)
         browser.close()
@@ -160,6 +206,14 @@ def main() -> None:
                 "time_field_name": "raw.info.E",
                 "field_name": "raw.price",
             },
+            "eventDropdownIncludesTargetEvents": all(e in event_options for e in ["trade", "order_book_snapshot", "ticker", "ohlcv"]),
+            "indicatorDeclDidNotFilterEvents": "order_book_snapshot" in event_options and "ohlcv" in event_options,
+            "tradeXYListsIdentical": trade_x_options == trade_y_options,
+            "orderBookXYListsIdentical": ob_x_options == ob_y_options,
+            "ohlcvXYListsIdentical": ohlcv_x_options == ohlcv_y_options,
+            "tradeRawPathsPresent": all(p in trade_x_options for p in ["raw.price", "raw.amount", "raw.info.p", "raw.info.q"]),
+            "orderBookArrayPathsPresent": all(p in ob_x_options for p in ["raw.bids[0][0]", "raw.bids[0][1]", "raw.asks[0][0]", "raw.asks[0][1]"]),
+            "ohlcvArrayPathsPresent": all(p in ohlcv_x_options for p in ["raw[0]", "raw[4]"]),
             "saveReloadRetained": True,
             "canvasRendered": canvas_count > 0,
             "echartsRendererActive": echarts_host_count == 2,
@@ -167,9 +221,11 @@ def main() -> None:
             "candleOverlayLineRendered": any(len(p.get("series_bindings", [])) > 0 for p in state["panels"] if p.get("chart_type") == "candle"),
             "tooltipConfigured": tooltip_count == 2,
             "dataZoomConfigured": data_zoom_count == 2,
-            "seriesSampleCount": len(samples),
+            "chartRenderOrZeroWarningVisible": canvas_count > 0 or warning_count > 0,
+            "seriesSampleCount": len(samples_by_event["trade"]),
             "fullWidthTinyRegressionAbsent": bool(chart_box and wrapper_box and chart_box["width"] > 900 and wrapper_box["width"] > 900),
             "normalizedOptionCount": normalized_options,
+            "scopedEventFetches": event_request_urls,
         },
         "panelState": state["panels"],
     }

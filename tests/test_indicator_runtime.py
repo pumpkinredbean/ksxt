@@ -271,6 +271,38 @@ class RawPassthroughTests(unittest.TestCase):
         self.assertEqual(out.timestamp, "1777000000000")
         self.assertEqual(out.meta["time_field"], "raw.info.T")
 
+    def test_raw_passthrough_supports_bracket_payload_path(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator
+
+        ind = RawPassthroughIndicator(field="raw.bids[0][1]", time_field="raw[0]")
+        out = ind.on_event({
+            "event_type": "order_book_snapshot",
+            "symbol": "BTC/USDT",
+            "market_scope": "",
+            "payload": {"raw": {"bids": [[70000, "1.25"]]}, "raw[0]": "1777000000000"},
+            "published_at": "2026-04-21T12:00:00+00:00",
+        })
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(out.value, 1.25)
+        self.assertEqual(out.timestamp, "1777000000000")
+
+    def test_builtin_raw_metadata_covers_supported_target_events_and_is_wildcard(self) -> None:
+        from src.indicator_runtime import RawPassthroughIndicator, _RAW_PASSTHROUGH_DECLARATION
+
+        self.assertEqual(RawPassthroughIndicator.inputs, ())
+        names = set(_RAW_PASSTHROUGH_DECLARATION.inputs[0].event_names)
+        self.assertGreaterEqual(names, {
+            "trade",
+            "order_book_snapshot",
+            "ticker",
+            "ohlcv",
+            "mark_price",
+            "funding_rate",
+            "open_interest",
+            "program_trade",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()
